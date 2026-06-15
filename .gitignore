@@ -1,0 +1,28 @@
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Rust build output
+/state/
+/vendor/
+/target/
+/debug/
+**/*.rs.bk
+*.pdb
+
+# Rust tooling output
+**/mutants.out*/
+lcov.info
+coverage/
+tarpaulin-report.html
+criterion/
+
+# Editors and IDEs
+.idea/
+.vscode/
+.cursor/
+.zed/
+*.code-workspace
