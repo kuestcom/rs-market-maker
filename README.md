@@ -15,21 +15,6 @@ The quoting strategy is intentionally simple: estimate fair value from the book
 midpoint, improve the visible top of book by one tick when possible, and keep a
 configurable edge away from fair value so it does not cross just to trade.
 
-## Project Layout
-
-```text
-src/
-  main.rs        CLI bootstrap
-  config.rs      args, env vars, validation
-  bot.rs         discovery/quote cycle orchestration
-  discovery.rs   market pagination, filtering, seen/new selection
-  orders.rs      auth, quote planning, cancel/create/post order flow
-  pricing.rs     fair price and quote math
-  state.rs       seen-market persistence
-tests/
-  unit/          external unit tests
-```
-
 ## Dry Run
 
 ```bash
@@ -38,22 +23,18 @@ cargo run
 
 ## Live Trading
 
-Live mode requires explicit signing configuration:
+Start live mode with:
 
 ```bash
-KUEST_PRIVATE_KEY=0x... \
-KUEST_DEPOSIT_WALLET=0x... \
-KUEST_CHAIN_ID=137 \
 cargo run -- --live
 ```
 
-Use `KUEST_CHAIN_ID=80002` for Amoy when that is the target chain.
+Live mode requires `KUEST_PRIVATE_KEY`, `KUEST_DEPOSIT_WALLET`, and
+`KUEST_CHAIN_ID`. You can also pass them as `--private-key`,
+`--deposit-wallet`, and `--chain-id`. Use chain id `137` for Polygon or `80002`
+for Amoy.
 
-By default live mode only posts buy orders:
-
-```bash
-MARKET_MAKER_QUOTE_SIDES=buy cargo run -- --live
-```
+By default live mode only posts buy orders.
 
 Use sell-side quoting only when the deposit wallet already owns outcome tokens
 for the market:
