@@ -39,6 +39,20 @@ fn zero_open_order_limit_is_rejected() {
     );
 }
 
+#[test]
+fn zero_loss_limit_is_rejected() {
+    let mut cli = valid_cli();
+    cli.max_loss_per_market = Decimal::ZERO;
+
+    let error = validate_cli(&cli).expect_err("zero market loss limit should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_MAX_LOSS_PER_MARKET")
+    );
+}
+
 fn valid_cli() -> Cli {
     Cli {
         clob_host: "https://clob.kuest.com".to_owned(),
@@ -62,6 +76,7 @@ fn valid_cli() -> Cli {
         min_price: dec!(0.05),
         max_price: dec!(0.95),
         max_collateral_per_market: dec!(25),
+        max_loss_per_market: dec!(25),
         max_total_collateral: dec!(50),
         min_free_collateral: Decimal::ONE,
         max_open_orders_per_token: 2,

@@ -75,9 +75,51 @@ struct QuotePlan {
     size: Decimal,
 }
 
+#[derive(Clone, Debug)]
+struct TokenQuote {
+    token_id: U256,
+    fair_price: Decimal,
+    plan: Option<QuotePlan>,
+}
+
+#[derive(Debug)]
+struct LiveMarketState {
+    tokens: Vec<LiveTokenState>,
+    pending_orders: Vec<ProposedOrder>,
+}
+
+#[derive(Debug)]
+struct LiveTokenState {
+    token_id: U256,
+    fair_price: Decimal,
+    balance: Decimal,
+    open_orders: Vec<OpenOrderResponse>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProposedOrder {
+    token_id: U256,
+    side: Side,
+    price: Decimal,
+    size: Decimal,
+}
+
+#[derive(Clone, Debug)]
+struct MarketExposure {
+    outcomes: Vec<OutcomeExposure>,
+}
+
+#[derive(Clone, Debug)]
+struct OutcomeExposure {
+    token_id: U256,
+    position: Decimal,
+    cost: Decimal,
+    proceeds: Decimal,
+}
+
 #[derive(Debug, PartialEq)]
 enum BuyTopUpDecision {
-    Place { size: Decimal },
+    Place { size: Decimal, collateral: Decimal },
     Skip { affordable_size: Decimal },
 }
 
@@ -117,6 +159,7 @@ pub(crate) async fn quote_market(
     global_budget: &mut RiskBudget,
 ) -> Result<()> {
     let mut market_budget = RiskBudget::new(cli.max_collateral_per_market);
+    let mut token_quotes = Vec::new();
 
     for token in &market.tokens {
         let request = OrderBookSummaryRequest::builder()
@@ -126,23 +169,56 @@ pub(crate) async fn quote_market(
             .order_book(&request)
             .await
             .with_context(|| format!("failed to fetch order book for token {}", token.token_id))?;
+        let token_quote = build_token_quote(market, token, &book, cli);
 
-        let Some(plan) = build_quote_plan(market, token, &book, cli) else {
+        if let Some(plan) = &token_quote.plan {
+            print_plan(plan, cli.live);
+        } else {
             println!(
                 "skip {} {}: no safe quote at configured edge/sides",
                 market.market_slug, token.outcome
             );
-            continue;
-        };
+        }
 
-        print_plan(&plan, cli.live);
+        token_quotes.push(token_quote);
+    }
 
-        if let Some(live) = live {
-            reconcile_quote_plan(live, &plan, cli, global_budget, &mut market_budget).await?;
+    if let Some(live) = live {
+        let mut market_state = LiveMarketState::load(live, &token_quotes).await?;
+        for token_quote in &token_quotes {
+            if let Some(plan) = &token_quote.plan {
+                reconcile_quote_plan(
+                    live,
+                    plan,
+                    cli,
+                    global_budget,
+                    &mut market_budget,
+                    &mut market_state,
+                )
+                .await?;
+            }
         }
     }
 
     Ok(())
+}
+
+fn build_token_quote(
+    market: &MarketResponse,
+    token: &Token,
+    book: &OrderBookSummaryResponse,
+    cli: &Cli,
+) -> TokenQuote {
+    TokenQuote {
+        token_id: token.token_id,
+        fair_price: fair_price(
+            best_bid(&book.bids),
+            best_ask(&book.asks),
+            token.price,
+            book.last_trade_price,
+        ),
+        plan: build_quote_plan(market, token, book, cli),
+    }
 }
 
 fn build_quote_plan(
@@ -247,8 +323,9 @@ async fn reconcile_quote_plan(
     cli: &Cli,
     global_budget: &mut RiskBudget,
     market_budget: &mut RiskBudget,
+    market_state: &mut LiveMarketState,
 ) -> Result<()> {
-    let open_orders = open_orders_for_token(live, plan.token_id).await?;
+    let open_orders = market_state.open_orders(plan.token_id)?.to_vec();
     let orders_to_cancel = cancellable_orders(&open_orders, plan, cli);
     if cli.cancel_before_quote && !orders_to_cancel.is_empty() {
         let order_ids = orders_to_cancel
@@ -279,12 +356,15 @@ async fn reconcile_quote_plan(
 
     let canceled_ids = orders_to_cancel
         .iter()
-        .map(|order| order.id.as_str())
+        .map(|order| order.id.clone())
         .collect::<BTreeSet<_>>();
+    drop(orders_to_cancel);
     let remaining_orders = open_orders
-        .iter()
-        .filter(|order| !canceled_ids.contains(order.id.as_str()))
+        .into_iter()
+        .filter(|order| !canceled_ids.contains(&order.id))
         .collect::<Vec<_>>();
+    market_state.replace_open_orders(plan.token_id, remaining_orders.clone())?;
+    let remaining_orders = remaining_orders.iter().collect::<Vec<_>>();
 
     for order in &remaining_orders {
         global_budget.reserve_open_buy_order(order);
@@ -292,7 +372,7 @@ async fn reconcile_quote_plan(
     }
 
     let collateral_balance = collateral_balance(live).await?;
-    let token_balance = conditional_balance(live, plan.token_id).await?;
+    let token_balance = market_state.token_balance(plan.token_id)?;
     let locked_collateral = remaining_orders
         .iter()
         .filter(|order| order.side == Side::Buy)
@@ -321,30 +401,40 @@ async fn reconcile_quote_plan(
         let open_size = matching_open_size(&remaining_orders, Side::Buy, price);
         if open_size < plan.size {
             let missing_size = plan.size - open_size;
-            match reserve_buy_top_up(
+            match buy_top_up_decision(
                 missing_size,
                 price,
                 free_collateral,
                 global_budget,
                 market_budget,
             ) {
-                BuyTopUpDecision::Place { size } => {
-                    let order = live
-                        .client
-                        .limit_order()
-                        .token_id(plan.token_id)
-                        .side(Side::Buy)
-                        .price(price)
-                        .size(size)
-                        .order_type(OrderType::GTC)
-                        .post_only(cli.post_only)
-                        .build()
-                        .await
-                        .with_context(|| {
-                            format!("failed to build buy order for token {}", plan.token_id)
-                        })?;
-                    orders.push((Side::Buy, live.client.sign(&live.signer, order).await?));
-                    new_order_slots -= 1;
+                BuyTopUpDecision::Place { size, collateral } => {
+                    let proposed_order = ProposedOrder {
+                        token_id: plan.token_id,
+                        side: Side::Buy,
+                        price,
+                        size,
+                    };
+                    if !market_loss_exceeds_cap(plan, proposed_order, market_state, cli)? {
+                        let order = live
+                            .client
+                            .limit_order()
+                            .token_id(plan.token_id)
+                            .side(Side::Buy)
+                            .price(price)
+                            .size(size)
+                            .order_type(OrderType::GTC)
+                            .post_only(cli.post_only)
+                            .build()
+                            .await
+                            .with_context(|| {
+                                format!("failed to build buy order for token {}", plan.token_id)
+                            })?;
+                        reserve_buy_collateral(collateral, global_budget, market_budget);
+                        market_state.record_pending_order(proposed_order);
+                        orders.push((Side::Buy, live.client.sign(&live.signer, order).await?));
+                        new_order_slots -= 1;
+                    }
                 }
                 BuyTopUpDecision::Skip { affordable_size } => {
                     println!(
@@ -364,21 +454,30 @@ async fn reconcile_quote_plan(
             let missing_size = plan.size - open_size;
             let size = min_decimal(missing_size, free_tokens);
             if size >= missing_size {
-                let order = live
-                    .client
-                    .limit_order()
-                    .token_id(plan.token_id)
-                    .side(Side::Sell)
-                    .price(price)
-                    .size(size)
-                    .order_type(OrderType::GTC)
-                    .post_only(cli.post_only)
-                    .build()
-                    .await
-                    .with_context(|| {
-                        format!("failed to build sell order for token {}", plan.token_id)
-                    })?;
-                orders.push((Side::Sell, live.client.sign(&live.signer, order).await?));
+                let proposed_order = ProposedOrder {
+                    token_id: plan.token_id,
+                    side: Side::Sell,
+                    price,
+                    size,
+                };
+                if !market_loss_exceeds_cap(plan, proposed_order, market_state, cli)? {
+                    let order = live
+                        .client
+                        .limit_order()
+                        .token_id(plan.token_id)
+                        .side(Side::Sell)
+                        .price(price)
+                        .size(size)
+                        .order_type(OrderType::GTC)
+                        .post_only(cli.post_only)
+                        .build()
+                        .await
+                        .with_context(|| {
+                            format!("failed to build sell order for token {}", plan.token_id)
+                        })?;
+                    market_state.record_pending_order(proposed_order);
+                    orders.push((Side::Sell, live.client.sign(&live.signer, order).await?));
+                }
             } else {
                 println!(
                     "skip {} {} sell: free token balance leaves size {} below required {}",
@@ -429,12 +528,187 @@ async fn open_orders_for_token(
     Ok(orders)
 }
 
-fn reserve_buy_top_up(
+impl LiveMarketState {
+    async fn load(live: &LiveTrading, token_quotes: &[TokenQuote]) -> Result<Self> {
+        let mut tokens = Vec::new();
+        for token_quote in token_quotes {
+            tokens.push(LiveTokenState {
+                token_id: token_quote.token_id,
+                fair_price: token_quote.fair_price,
+                balance: conditional_balance(live, token_quote.token_id).await?,
+                open_orders: open_orders_for_token(live, token_quote.token_id).await?,
+            });
+        }
+
+        Ok(Self {
+            tokens,
+            pending_orders: Vec::new(),
+        })
+    }
+
+    fn open_orders(&self, token_id: U256) -> Result<&[OpenOrderResponse]> {
+        Ok(&self.token_state(token_id)?.open_orders)
+    }
+
+    fn token_balance(&self, token_id: U256) -> Result<Decimal> {
+        Ok(self.token_state(token_id)?.balance)
+    }
+
+    fn replace_open_orders(
+        &mut self,
+        token_id: U256,
+        open_orders: Vec<OpenOrderResponse>,
+    ) -> Result<()> {
+        self.token_state_mut(token_id)?.open_orders = open_orders;
+        Ok(())
+    }
+
+    fn projected_loss(&self, order: ProposedOrder) -> Result<Decimal> {
+        let mut exposure = self.exposure();
+        exposure.apply_order(order)?;
+        Ok(exposure.worst_loss())
+    }
+
+    fn record_pending_order(&mut self, order: ProposedOrder) {
+        self.pending_orders.push(order);
+    }
+
+    fn exposure(&self) -> MarketExposure {
+        let mut exposure = MarketExposure {
+            outcomes: self
+                .tokens
+                .iter()
+                .map(|token| OutcomeExposure {
+                    token_id: token.token_id,
+                    position: token.balance,
+                    cost: token.balance * token.fair_price,
+                    proceeds: Decimal::ZERO,
+                })
+                .collect(),
+        };
+
+        for token in &self.tokens {
+            for order in &token.open_orders {
+                let order = ProposedOrder {
+                    token_id: token.token_id,
+                    side: order.side,
+                    price: order.price,
+                    size: open_order_remaining_size(order),
+                };
+                exposure.apply_known_order(order);
+            }
+        }
+        for order in &self.pending_orders {
+            exposure.apply_known_order(*order);
+        }
+
+        exposure
+    }
+
+    fn token_state(&self, token_id: U256) -> Result<&LiveTokenState> {
+        self.tokens
+            .iter()
+            .find(|token| token.token_id == token_id)
+            .with_context(|| format!("missing live market state for token {token_id}"))
+    }
+
+    fn token_state_mut(&mut self, token_id: U256) -> Result<&mut LiveTokenState> {
+        self.tokens
+            .iter_mut()
+            .find(|token| token.token_id == token_id)
+            .with_context(|| format!("missing live market state for token {token_id}"))
+    }
+}
+
+impl MarketExposure {
+    fn apply_order(&mut self, order: ProposedOrder) -> Result<()> {
+        let outcome = self
+            .outcomes
+            .iter_mut()
+            .find(|outcome| outcome.token_id == order.token_id)
+            .with_context(|| format!("missing exposure state for token {}", order.token_id))?;
+        apply_order_to_outcome(outcome, order);
+        Ok(())
+    }
+
+    fn apply_known_order(&mut self, order: ProposedOrder) {
+        if let Some(outcome) = self
+            .outcomes
+            .iter_mut()
+            .find(|outcome| outcome.token_id == order.token_id)
+        {
+            apply_order_to_outcome(outcome, order);
+        }
+    }
+
+    fn worst_loss(&self) -> Decimal {
+        let cost = self
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.cost)
+            .sum::<Decimal>();
+        let proceeds = self
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.proceeds)
+            .sum::<Decimal>();
+        let worst_resolution_payout = if self.outcomes.len() > 1 {
+            self.outcomes
+                .iter()
+                .map(|outcome| outcome.position)
+                .min_by(|left, right| left.cmp(right))
+                .unwrap_or(Decimal::ZERO)
+        } else {
+            Decimal::ZERO
+        };
+
+        max_decimal(cost - proceeds - worst_resolution_payout, Decimal::ZERO)
+    }
+}
+
+fn apply_order_to_outcome(outcome: &mut OutcomeExposure, order: ProposedOrder) {
+    match order.side {
+        Side::Buy => {
+            outcome.position += order.size;
+            outcome.cost += order.size * order.price;
+        }
+        Side::Sell => {
+            outcome.position -= order.size;
+            outcome.proceeds += order.size * order.price;
+        }
+        Side::Unknown => {}
+        _ => {}
+    }
+}
+
+fn market_loss_exceeds_cap(
+    plan: &QuotePlan,
+    proposed_order: ProposedOrder,
+    market_state: &LiveMarketState,
+    cli: &Cli,
+) -> Result<bool> {
+    let projected_loss = market_state.projected_loss(proposed_order)?;
+    if projected_loss <= cli.max_loss_per_market {
+        return Ok(false);
+    }
+
+    println!(
+        "skip {} {} {:?}: projected market loss {} exceeds cap {}",
+        plan.market_slug,
+        plan.outcome,
+        proposed_order.side,
+        projected_loss,
+        cli.max_loss_per_market
+    );
+    Ok(true)
+}
+
+fn buy_top_up_decision(
     missing_size: Decimal,
     price: Decimal,
     free_collateral: Decimal,
-    global_budget: &mut RiskBudget,
-    market_budget: &mut RiskBudget,
+    global_budget: &RiskBudget,
+    market_budget: &RiskBudget,
 ) -> BuyTopUpDecision {
     let affordable_size = affordable_buy_size(
         missing_size,
@@ -448,12 +722,21 @@ fn reserve_buy_top_up(
     }
 
     let collateral = missing_size * price;
+    BuyTopUpDecision::Place {
+        size: missing_size,
+        collateral,
+    }
+}
+
+fn reserve_buy_collateral(
+    collateral: Decimal,
+    global_budget: &mut RiskBudget,
+    market_budget: &mut RiskBudget,
+) {
     let global_reserved = global_budget.reserve_new_collateral(collateral);
     let market_reserved = market_budget.reserve_new_collateral(global_reserved);
     debug_assert_eq!(global_reserved, collateral);
     debug_assert_eq!(market_reserved, collateral);
-
-    BuyTopUpDecision::Place { size: missing_size }
 }
 
 fn affordable_buy_size(
@@ -619,16 +902,11 @@ mod tests {
 
     #[test]
     fn buy_top_up_skip_does_not_reserve_collateral() {
-        let mut global_budget = RiskBudget::new(dec!(10));
-        let mut market_budget = RiskBudget::new(dec!(10));
+        let global_budget = RiskBudget::new(dec!(10));
+        let market_budget = RiskBudget::new(dec!(10));
 
-        let decision = reserve_buy_top_up(
-            dec!(5),
-            dec!(0.50),
-            dec!(1),
-            &mut global_budget,
-            &mut market_budget,
-        );
+        let decision =
+            buy_top_up_decision(dec!(5), dec!(0.50), dec!(1), &global_budget, &market_budget);
 
         assert_eq!(
             decision,
@@ -645,16 +923,109 @@ mod tests {
         let mut global_budget = RiskBudget::new(dec!(10));
         let mut market_budget = RiskBudget::new(dec!(10));
 
-        let decision = reserve_buy_top_up(
+        let decision = buy_top_up_decision(
             dec!(2),
             dec!(0.50),
             dec!(10),
-            &mut global_budget,
-            &mut market_budget,
+            &global_budget,
+            &market_budget,
         );
 
-        assert_eq!(decision, BuyTopUpDecision::Place { size: dec!(2) });
+        assert_eq!(
+            decision,
+            BuyTopUpDecision::Place {
+                size: dec!(2),
+                collateral: dec!(1)
+            }
+        );
+        reserve_buy_collateral(dec!(1), &mut global_budget, &mut market_budget);
         assert_eq!(global_budget.remaining_collateral(), dec!(9));
         assert_eq!(market_budget.remaining_collateral(), dec!(9));
+    }
+
+    #[test]
+    fn market_exposure_counts_complete_set_as_hedged() {
+        let exposure = MarketExposure {
+            outcomes: vec![
+                OutcomeExposure {
+                    token_id: U256::from(1),
+                    position: dec!(5),
+                    cost: dec!(2.5),
+                    proceeds: Decimal::ZERO,
+                },
+                OutcomeExposure {
+                    token_id: U256::from(2),
+                    position: dec!(5),
+                    cost: dec!(2.5),
+                    proceeds: Decimal::ZERO,
+                },
+            ],
+        };
+
+        assert_eq!(exposure.worst_loss(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn projected_buy_loss_uses_worst_resolution() {
+        let mut exposure = MarketExposure {
+            outcomes: vec![
+                OutcomeExposure {
+                    token_id: U256::from(1),
+                    position: Decimal::ZERO,
+                    cost: Decimal::ZERO,
+                    proceeds: Decimal::ZERO,
+                },
+                OutcomeExposure {
+                    token_id: U256::from(2),
+                    position: Decimal::ZERO,
+                    cost: Decimal::ZERO,
+                    proceeds: Decimal::ZERO,
+                },
+            ],
+        };
+
+        exposure
+            .apply_order(ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            })
+            .expect("known token should accept order");
+
+        assert_eq!(exposure.worst_loss(), dec!(2));
+    }
+
+    #[test]
+    fn projected_cross_outcome_buys_can_reduce_loss() {
+        let mut exposure = MarketExposure {
+            outcomes: vec![
+                OutcomeExposure {
+                    token_id: U256::from(1),
+                    position: Decimal::ZERO,
+                    cost: Decimal::ZERO,
+                    proceeds: Decimal::ZERO,
+                },
+                OutcomeExposure {
+                    token_id: U256::from(2),
+                    position: Decimal::ZERO,
+                    cost: Decimal::ZERO,
+                    proceeds: Decimal::ZERO,
+                },
+            ],
+        };
+
+        for token_id in [U256::from(1), U256::from(2)] {
+            exposure
+                .apply_order(ProposedOrder {
+                    token_id,
+                    side: Side::Buy,
+                    price: dec!(0.40),
+                    size: dec!(5),
+                })
+                .expect("known token should accept order");
+        }
+
+        assert_eq!(exposure.worst_loss(), Decimal::ZERO);
     }
 }

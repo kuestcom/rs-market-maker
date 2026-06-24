@@ -61,7 +61,8 @@ has zero balance for that outcome token and the order size is 5 shares
 Live mode also checks open orders and balances before posting. It subtracts
 collateral already locked by live buy orders, checks sell orders against
 available outcome-token balance, respects configured collateral caps, and
-requires a two-sided book by default before quoting.
+blocks quotes whose simulated fill would exceed the configured market loss cap.
+It also requires a two-sided book by default before quoting.
 
 ## CLI args / env vars
 
@@ -178,6 +179,13 @@ requires a two-sided book by default before quoting.
   --max-collateral-per-market / MARKET_MAKER_MAX_COLLATERAL_PER_MARKET
   Default: 25.
   Maximum collateral exposure counted for one market in a cycle.
+
+  --max-loss-per-market / MARKET_MAKER_MAX_LOSS_PER_MARKET
+  Default: 25.
+  Maximum simulated worst-case market loss allowed after existing balances,
+  open orders, and the proposed new order are counted. Necessary because
+  collateral caps alone do not account for cross-outcome inventory. Existing
+  balances are marked at current fair value because fill history is not tracked.
 
   --max-total-collateral / MARKET_MAKER_MAX_TOTAL_COLLATERAL
   Default: 50.
