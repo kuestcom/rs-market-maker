@@ -75,6 +75,12 @@ struct QuotePlan {
     size: Decimal,
 }
 
+#[derive(Debug, PartialEq)]
+enum BuyTopUpDecision {
+    Place { size: Decimal },
+    Skip { affordable_size: Decimal },
+}
+
 pub(crate) async fn authenticate(cli: &Cli) -> Result<LiveTrading> {
     let private_key = cli
         .private_key
@@ -315,44 +321,37 @@ async fn reconcile_quote_plan(
         let open_size = matching_open_size(&remaining_orders, Side::Buy, price);
         if open_size < plan.size {
             let missing_size = plan.size - open_size;
-            let requested_collateral = missing_size * price;
-            let affordable_collateral = [
-                requested_collateral,
+            match reserve_buy_top_up(
+                missing_size,
+                price,
                 free_collateral,
-                global_budget.remaining_collateral(),
-                market_budget.remaining_collateral(),
-            ]
-            .into_iter()
-            .fold(requested_collateral, min_decimal);
-            let global_reserved = global_budget.reserve_new_collateral(affordable_collateral);
-            let market_reserved = market_budget.reserve_new_collateral(global_reserved);
-            let size = if price > Decimal::ZERO {
-                market_reserved / price
-            } else {
-                Decimal::ZERO
-            };
-            if size >= plan.size {
-                let order = live
-                    .client
-                    .limit_order()
-                    .token_id(plan.token_id)
-                    .side(Side::Buy)
-                    .price(price)
-                    .size(size)
-                    .order_type(OrderType::GTC)
-                    .post_only(cli.post_only)
-                    .build()
-                    .await
-                    .with_context(|| {
-                        format!("failed to build buy order for token {}", plan.token_id)
-                    })?;
-                orders.push((Side::Buy, live.client.sign(&live.signer, order).await?));
-                new_order_slots -= 1;
-            } else {
-                println!(
-                    "skip {} {} buy: risk budget/free collateral leaves size {} below required {}",
-                    plan.market_slug, plan.outcome, size, plan.size
-                );
+                global_budget,
+                market_budget,
+            ) {
+                BuyTopUpDecision::Place { size } => {
+                    let order = live
+                        .client
+                        .limit_order()
+                        .token_id(plan.token_id)
+                        .side(Side::Buy)
+                        .price(price)
+                        .size(size)
+                        .order_type(OrderType::GTC)
+                        .post_only(cli.post_only)
+                        .build()
+                        .await
+                        .with_context(|| {
+                            format!("failed to build buy order for token {}", plan.token_id)
+                        })?;
+                    orders.push((Side::Buy, live.client.sign(&live.signer, order).await?));
+                    new_order_slots -= 1;
+                }
+                BuyTopUpDecision::Skip { affordable_size } => {
+                    println!(
+                        "skip {} {} buy: risk budget/free collateral leaves size {} below required {}",
+                        plan.market_slug, plan.outcome, affordable_size, missing_size
+                    );
+                }
             }
         }
     }
@@ -364,7 +363,7 @@ async fn reconcile_quote_plan(
         if open_size < plan.size {
             let missing_size = plan.size - open_size;
             let size = min_decimal(missing_size, free_tokens);
-            if size >= plan.size {
+            if size >= missing_size {
                 let order = live
                     .client
                     .limit_order()
@@ -383,7 +382,7 @@ async fn reconcile_quote_plan(
             } else {
                 println!(
                     "skip {} {} sell: free token balance leaves size {} below required {}",
-                    plan.market_slug, plan.outcome, size, plan.size
+                    plan.market_slug, plan.outcome, size, missing_size
                 );
             }
         }
@@ -399,10 +398,7 @@ async fn reconcile_quote_plan(
         .map(|(_, order)| order)
         .collect::<Vec<_>>();
     let responses = live.client.post_orders(signed_orders).await?;
-    let responses = sides
-        .into_iter()
-        .zip(responses.into_iter())
-        .collect::<Vec<_>>();
+    let responses = sides.into_iter().zip(responses).collect::<Vec<_>>();
     print_post_responses(plan, &responses);
 
     Ok(())
@@ -431,6 +427,57 @@ async fn open_orders_for_token(
     }
 
     Ok(orders)
+}
+
+fn reserve_buy_top_up(
+    missing_size: Decimal,
+    price: Decimal,
+    free_collateral: Decimal,
+    global_budget: &mut RiskBudget,
+    market_budget: &mut RiskBudget,
+) -> BuyTopUpDecision {
+    let affordable_size = affordable_buy_size(
+        missing_size,
+        price,
+        free_collateral,
+        global_budget,
+        market_budget,
+    );
+    if affordable_size < missing_size {
+        return BuyTopUpDecision::Skip { affordable_size };
+    }
+
+    let collateral = missing_size * price;
+    let global_reserved = global_budget.reserve_new_collateral(collateral);
+    let market_reserved = market_budget.reserve_new_collateral(global_reserved);
+    debug_assert_eq!(global_reserved, collateral);
+    debug_assert_eq!(market_reserved, collateral);
+
+    BuyTopUpDecision::Place { size: missing_size }
+}
+
+fn affordable_buy_size(
+    missing_size: Decimal,
+    price: Decimal,
+    free_collateral: Decimal,
+    global_budget: &RiskBudget,
+    market_budget: &RiskBudget,
+) -> Decimal {
+    if missing_size <= Decimal::ZERO || price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    let requested_collateral = missing_size * price;
+    let affordable_collateral = [
+        requested_collateral,
+        free_collateral,
+        global_budget.remaining_collateral(),
+        market_budget.remaining_collateral(),
+    ]
+    .into_iter()
+    .fold(requested_collateral, min_decimal);
+
+    affordable_collateral / price
 }
 
 async fn collateral_balance(live: &LiveTrading) -> Result<Decimal> {
@@ -507,7 +554,7 @@ fn cancellable_orders<'a>(
         .collect::<Vec<_>>();
 
     if kept.len() > cli.max_open_orders_per_token {
-        kept.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        kept.sort_by_key(|left| left.created_at);
         for order in kept.into_iter().skip(cli.max_open_orders_per_token) {
             if cancellable_ids.insert(order.id.as_str()) {
                 cancellable.push(order);
@@ -561,5 +608,53 @@ fn print_post_responses(plan: &QuotePlan, responses: &[(Side, PostOrderResponse)
             response.status,
             response.error_msg
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[test]
+    fn buy_top_up_skip_does_not_reserve_collateral() {
+        let mut global_budget = RiskBudget::new(dec!(10));
+        let mut market_budget = RiskBudget::new(dec!(10));
+
+        let decision = reserve_buy_top_up(
+            dec!(5),
+            dec!(0.50),
+            dec!(1),
+            &mut global_budget,
+            &mut market_budget,
+        );
+
+        assert_eq!(
+            decision,
+            BuyTopUpDecision::Skip {
+                affordable_size: dec!(2)
+            }
+        );
+        assert_eq!(global_budget.remaining_collateral(), dec!(10));
+        assert_eq!(market_budget.remaining_collateral(), dec!(10));
+    }
+
+    #[test]
+    fn buy_top_up_reserves_only_missing_size() {
+        let mut global_budget = RiskBudget::new(dec!(10));
+        let mut market_budget = RiskBudget::new(dec!(10));
+
+        let decision = reserve_buy_top_up(
+            dec!(2),
+            dec!(0.50),
+            dec!(10),
+            &mut global_budget,
+            &mut market_budget,
+        );
+
+        assert_eq!(decision, BuyTopUpDecision::Place { size: dec!(2) });
+        assert_eq!(global_budget.remaining_collateral(), dec!(9));
+        assert_eq!(market_budget.remaining_collateral(), dec!(9));
     }
 }
