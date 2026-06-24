@@ -18,6 +18,13 @@ pub struct Cli {
     )]
     pub clob_host: String,
 
+    #[arg(
+        long,
+        env = "KUEST_GAMMA_HOST",
+        default_value = "https://gamma-api.polymarket.com"
+    )]
+    pub gamma_host: String,
+
     #[arg(long, env = "MARKET_MAKER_LIVE", default_value_t = false)]
     pub live: bool,
 
@@ -32,6 +39,9 @@ pub struct Cli {
 
     #[arg(long, env = "MARKET_MAKER_DISCOVERY", value_enum, default_value_t = DiscoveryMode::Auto)]
     pub discovery: DiscoveryMode,
+
+    #[arg(long, env = "MARKET_MAKER_EVENT_SLUG")]
+    pub event_slug: Option<String>,
 
     #[arg(long, env = "MARKET_MAKER_MAX_MARKETS", default_value_t = 3)]
     pub max_markets: usize,
@@ -66,6 +76,39 @@ pub struct Cli {
 
     #[arg(long, env = "MARKET_MAKER_POST_ONLY", default_value_t = true)]
     pub post_only: bool,
+
+    #[arg(
+        long,
+        env = "MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE",
+        default_value_t = true
+    )]
+    pub require_two_sided_live: bool,
+
+    #[arg(long, env = "MARKET_MAKER_MIN_PRICE", default_value = "0.05")]
+    pub min_price: Decimal,
+
+    #[arg(long, env = "MARKET_MAKER_MAX_PRICE", default_value = "0.95")]
+    pub max_price: Decimal,
+
+    #[arg(
+        long,
+        env = "MARKET_MAKER_MAX_COLLATERAL_PER_MARKET",
+        default_value = "25"
+    )]
+    pub max_collateral_per_market: Decimal,
+
+    #[arg(long, env = "MARKET_MAKER_MAX_TOTAL_COLLATERAL", default_value = "50")]
+    pub max_total_collateral: Decimal,
+
+    #[arg(long, env = "MARKET_MAKER_MIN_FREE_COLLATERAL", default_value = "1")]
+    pub min_free_collateral: Decimal,
+
+    #[arg(
+        long,
+        env = "MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN",
+        default_value_t = 2
+    )]
+    pub max_open_orders_per_token: usize,
 
     #[arg(long, env = "MARKET_MAKER_DISCOVER_ONLY", default_value_t = false)]
     pub discover_only: bool,
@@ -123,6 +166,37 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.min_spread_ticks == 0 {
         bail!("MARKET_MAKER_MIN_SPREAD_TICKS must be greater than zero");
+    }
+    if cli
+        .event_slug
+        .as_deref()
+        .is_some_and(|slug| slug.trim().is_empty())
+    {
+        bail!("MARKET_MAKER_EVENT_SLUG cannot be empty");
+    }
+    if cli.gamma_host.trim().is_empty() {
+        bail!("KUEST_GAMMA_HOST must not be empty");
+    }
+    if cli.min_price <= Decimal::ZERO || cli.min_price >= Decimal::ONE {
+        bail!("MARKET_MAKER_MIN_PRICE must be between 0 and 1");
+    }
+    if cli.max_price <= Decimal::ZERO || cli.max_price >= Decimal::ONE {
+        bail!("MARKET_MAKER_MAX_PRICE must be between 0 and 1");
+    }
+    if cli.min_price >= cli.max_price {
+        bail!("MARKET_MAKER_MIN_PRICE must be less than MARKET_MAKER_MAX_PRICE");
+    }
+    if cli.max_collateral_per_market <= Decimal::ZERO {
+        bail!("MARKET_MAKER_MAX_COLLATERAL_PER_MARKET must be greater than zero");
+    }
+    if cli.max_total_collateral <= Decimal::ZERO {
+        bail!("MARKET_MAKER_MAX_TOTAL_COLLATERAL must be greater than zero");
+    }
+    if cli.min_free_collateral < Decimal::ZERO {
+        bail!("MARKET_MAKER_MIN_FREE_COLLATERAL cannot be negative");
+    }
+    if cli.max_open_orders_per_token == 0 {
+        bail!("MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN must be greater than zero");
     }
     if cli.live {
         if cli.private_key.as_deref().is_none_or(str::is_empty) {
