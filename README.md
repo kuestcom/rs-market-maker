@@ -7,6 +7,8 @@
 
 - Finds active, tradable markets from the fork site and records newly seen
   market ids in `state/seen-markets.json`.
+- Can be pinned to a single event slug so it keeps trading only that event's
+  markets.
 - Computes configurable buy/sell quotes per selected outcome token. It defaults
   to buy-only because sell orders require existing outcome-token inventory.
 - Posts GTC limit orders only when `--live` is set. Dry-run is the default.
@@ -20,6 +22,15 @@ configurable edge away from fair value so it does not cross just to trade.
 ```bash
 cargo run
 ```
+
+To keep the bot scoped to one event, pass the event slug:
+
+```bash
+cargo run -- --event-slug lowest-temperature-in-nyc-on-june-24-2026
+```
+
+Event mode reads `.sdk/site-config.json`, uses the configured Kuest site API,
+and resolves the event's CLOB condition ids from that fork.
 
 ## Live Trading
 
@@ -46,6 +57,11 @@ MARKET_MAKER_QUOTE_SIDES=both cargo run -- --live
 If a sell order returns `position balance 0 below required 5000000`, the wallet
 has zero balance for that outcome token and the order size is 5 shares
 (`5 * 10^6` base units).
+
+Live mode also checks open orders and balances before posting. It subtracts
+collateral already locked by live buy orders, checks sell orders against
+available outcome-token balance, respects configured collateral caps, and
+requires a two-sided book by default before quoting.
 
 ## CLI args / env vars
 
@@ -84,6 +100,12 @@ has zero balance for that outcome token and the order size is 5 shares
   markets, site uses broader fork-site active markets, auto tries sampling
   first then falls back. Necessary because “new markets from the fork site”
   and “markets worth quoting” are not always the same set.
+
+  --event-slug / MARKET_MAKER_EVENT_SLUG
+  Optional.
+  If set, the bot ignores normal discovery and keeps trading only the markets
+  under this event slug. It resolves markets from the Kuest fork configured in
+  .sdk/site-config.json.
 
   --max-markets / MARKET_MAKER_MAX_MARKETS
   Default: 3.
@@ -138,6 +160,36 @@ has zero balance for that outcome token and the order size is 5 shares
   Default: true.
   Tells the CLOB to reject orders that would immediately take liquidity.
   Necessary for a market-maker posture: rest orders, do not cross.
+
+  --require-two-sided-live / MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE
+  Default: true.
+  In live mode, skip tokens without a reliable bid and ask. Necessary because
+  fallback prices like 0.5 are not safe enough for real money.
+
+  --min-price / MARKET_MAKER_MIN_PRICE
+  Default: 0.05.
+  Lower bound for posted quote prices. Necessary to avoid extreme tail prices
+  where one bad fill can dominate the small edge.
+
+  --max-price / MARKET_MAKER_MAX_PRICE
+  Default: 0.95.
+  Upper bound for posted quote prices. Same risk control as --min-price.
+
+  --max-collateral-per-market / MARKET_MAKER_MAX_COLLATERAL_PER_MARKET
+  Default: 25.
+  Maximum collateral exposure counted for one market in a cycle.
+
+  --max-total-collateral / MARKET_MAKER_MAX_TOTAL_COLLATERAL
+  Default: 50.
+  Maximum collateral exposure counted across all markets in a cycle.
+
+  --min-free-collateral / MARKET_MAKER_MIN_FREE_COLLATERAL
+  Default: 1.
+  Collateral buffer left unused after subtracting open buy orders.
+
+  --max-open-orders-per-token / MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN
+  Default: 2.
+  Caps live open orders per token after reconciliation.
 
   --discover-only / MARKET_MAKER_DISCOVER_ONLY
   Default: false.
