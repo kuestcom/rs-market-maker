@@ -18,13 +18,6 @@ pub struct Cli {
     )]
     pub clob_host: String,
 
-    #[arg(
-        long,
-        env = "KUEST_GAMMA_HOST",
-        default_value = "https://gamma-api.polymarket.com"
-    )]
-    pub gamma_host: String,
-
     #[arg(long, env = "MARKET_MAKER_LIVE", default_value_t = false)]
     pub live: bool,
 
@@ -173,9 +166,6 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
         .is_some_and(|slug| slug.trim().is_empty())
     {
         bail!("MARKET_MAKER_EVENT_SLUG cannot be empty");
-    }
-    if cli.gamma_host.trim().is_empty() {
-        bail!("KUEST_GAMMA_HOST must not be empty");
     }
     if cli.min_price <= Decimal::ZERO || cli.min_price >= Decimal::ONE {
         bail!("MARKET_MAKER_MIN_PRICE must be between 0 and 1");

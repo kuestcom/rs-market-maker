@@ -29,9 +29,8 @@ To keep the bot scoped to one event, pass the event slug:
 cargo run -- --event-slug lowest-temperature-in-nyc-on-june-24-2026
 ```
 
-When `.sdk/site-config.json` exists, event mode reads the configured site API
-and resolves the event's CLOB condition ids from that fork. Without that file,
-it falls back to the configurable Gamma host.
+Event mode reads `.sdk/site-config.json`, uses the configured Kuest site API,
+and resolves the event's CLOB condition ids from that fork.
 
 ## Live Trading
 
@@ -74,11 +73,6 @@ requires a two-sided book by default before quoting.
   auth, signing metadata, and order posting all go through the CLOB API.
   Keep configurable for prod/staging/forks.
 
-  --gamma-host / KUEST_GAMMA_HOST
-  Default: https://gamma-api.polymarket.com
-  Metadata API used only as a fallback for --event-slug when no
-  .sdk/site-config.json site_url is available.
-
   --live / MARKET_MAKER_LIVE
   Default: false
   Safety switch. Without it, the bot only prints intended quotes. Necessary
@@ -110,8 +104,8 @@ requires a two-sided book by default before quoting.
   --event-slug / MARKET_MAKER_EVENT_SLUG
   Optional.
   If set, the bot ignores normal discovery and keeps trading only the markets
-  under this event slug. With .sdk/site-config.json it resolves from the fork
-  site's /api/events endpoint; otherwise it uses --gamma-host.
+  under this event slug. It resolves markets from the Kuest fork configured in
+  .sdk/site-config.json.
 
   --max-markets / MARKET_MAKER_MAX_MARKETS
   Default: 3.

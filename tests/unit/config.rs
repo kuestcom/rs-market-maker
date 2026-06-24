@@ -42,7 +42,6 @@ fn zero_open_order_limit_is_rejected() {
 fn valid_cli() -> Cli {
     Cli {
         clob_host: "https://clob.kuest.com".to_owned(),
-        gamma_host: "https://gamma-api.polymarket.com".to_owned(),
         live: false,
         private_key: None,
         deposit_wallet: None,

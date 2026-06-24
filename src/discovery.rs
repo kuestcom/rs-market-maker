@@ -4,9 +4,6 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use kuest_client_sdk::clob::types::response::MarketResponse;
-use kuest_client_sdk::gamma::Client as GammaClient;
-use kuest_client_sdk::gamma::types::request::EventBySlugRequest;
-use kuest_client_sdk::gamma::types::response::Market as GammaMarket;
 use kuest_client_sdk::types::B256;
 use kuest_client_sdk::types::Decimal;
 use reqwest::Url;
@@ -46,14 +43,10 @@ pub(crate) async fn discover_markets(
 
 pub(crate) async fn discover_event_markets(
     clob_client: &PublicClient,
-    gamma_client: &GammaClient,
     event_slug: &str,
     max_pages: usize,
 ) -> Result<Vec<MarketResponse>> {
-    let condition_ids = match condition_ids_from_site_config(event_slug, max_pages).await? {
-        Some(condition_ids) => condition_ids,
-        None => condition_ids_from_gamma(gamma_client, event_slug).await?,
-    };
+    let condition_ids = condition_ids_from_site_config(event_slug, max_pages).await?;
 
     let mut markets = Vec::new();
     for condition_id in condition_ids {
@@ -167,40 +160,11 @@ pub(crate) fn market_key(market: &MarketResponse) -> String {
         .unwrap_or_else(|| market.market_slug.clone())
 }
 
-async fn condition_ids_from_gamma(
-    gamma_client: &GammaClient,
-    event_slug: &str,
-) -> Result<BTreeSet<String>> {
-    let request = EventBySlugRequest::builder()
-        .slug(event_slug.to_owned())
-        .build();
-    let event = gamma_client
-        .event_by_slug(&request)
-        .await
-        .with_context(|| format!("failed to fetch event slug {event_slug} from Gamma"))?;
-    let markets = event.markets.unwrap_or_default();
-    Ok(condition_ids_from_gamma_markets(markets))
-}
-
-fn condition_ids_from_gamma_markets(markets: Vec<GammaMarket>) -> BTreeSet<String> {
-    markets
-        .into_iter()
-        .filter_map(|market| {
-            market
-                .condition_id
-                .map(|condition_id| condition_id.to_string())
-        })
-        .collect()
-}
-
 async fn condition_ids_from_site_config(
     event_slug: &str,
     max_pages: usize,
-) -> Result<Option<BTreeSet<String>>> {
-    let Some(site_url) = site_url_from_config(Path::new(".sdk/site-config.json"))? else {
-        return Ok(None);
-    };
-
+) -> Result<BTreeSet<String>> {
+    let site_url = site_url_from_config(Path::new(".sdk/site-config.json"))?;
     let events = fetch_site_events(&site_url, max_pages).await?;
     let condition_ids = events
         .into_iter()
@@ -219,13 +183,12 @@ async fn condition_ids_from_site_config(
         })
         .unwrap_or_default();
 
-    Ok(Some(condition_ids))
+    Ok(condition_ids)
 }
 
-fn site_url_from_config(path: &Path) -> Result<Option<String>> {
+fn site_url_from_config(path: &Path) -> Result<String> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", path.display()));
         }
@@ -234,11 +197,11 @@ fn site_url_from_config(path: &Path) -> Result<Option<String>> {
         .with_context(|| format!("failed to parse {}", path.display()))?;
     let site_url = config.site_url.trim();
     if site_url.is_empty() {
-        Ok(None)
+        anyhow::bail!("{}.site_url must not be empty", path.display());
     } else if site_url.starts_with("http://") || site_url.starts_with("https://") {
-        Ok(Some(site_url.to_owned()))
+        Ok(site_url.to_owned())
     } else {
-        Ok(Some(format!("https://{site_url}")))
+        Ok(format!("https://{site_url}"))
     }
 }
 

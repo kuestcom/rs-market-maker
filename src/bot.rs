@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use kuest_client_sdk::clob::{Client, Config};
-use kuest_client_sdk::gamma::Client as GammaClient;
 use tokio::time::sleep;
 
 use crate::config::Cli;
@@ -16,14 +15,6 @@ use crate::state::SeenMarkets;
 pub async fn run(cli: Cli) -> Result<()> {
     let public_client = Client::new(&cli.clob_host, Config::default())
         .with_context(|| format!("failed to create CLOB client for {}", cli.clob_host))?;
-    let gamma_client = if cli.event_slug.is_some() {
-        Some(
-            GammaClient::new(&cli.gamma_host)
-                .with_context(|| format!("failed to create Gamma client for {}", cli.gamma_host))?,
-        )
-    } else {
-        None
-    };
     let live = if cli.live {
         Some(authenticate(&cli).await?)
     } else {
@@ -39,12 +30,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 "cycle {cycle}/{}: discovering markets for event {event_slug}",
                 cli.cycles
             );
-            let gamma_client = gamma_client
-                .as_ref()
-                .expect("gamma client exists when event slug is configured");
-            let markets =
-                discover_event_markets(&public_client, gamma_client, event_slug, cli.max_pages)
-                    .await?;
+            let markets = discover_event_markets(&public_client, event_slug, cli.max_pages).await?;
             select_event_candidates(markets, cli.max_markets)
         } else {
             println!("cycle {cycle}/{}: discovering markets", cli.cycles);
