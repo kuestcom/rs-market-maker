@@ -53,6 +53,30 @@ fn zero_loss_limit_is_rejected() {
     );
 }
 
+#[test]
+fn zero_max_book_spread_is_rejected() {
+    let mut cli = valid_cli();
+    cli.max_book_spread_ticks = 0;
+
+    let error = validate_cli(&cli).expect_err("zero book spread limit should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS")
+    );
+}
+
+#[test]
+fn negative_top_depth_is_rejected() {
+    let mut cli = valid_cli();
+    cli.min_top_depth = dec!(-1);
+
+    let error = validate_cli(&cli).expect_err("negative top depth should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_MIN_TOP_DEPTH"));
+}
+
 fn valid_cli() -> Cli {
     Cli {
         clob_host: "https://clob.kuest.com".to_owned(),
@@ -67,6 +91,8 @@ fn valid_cli() -> Cli {
         order_size: dec!(5),
         edge_ticks: 1,
         min_spread_ticks: 2,
+        max_book_spread_ticks: 20,
+        min_top_depth: dec!(5),
         quote_sides: QuoteSides::Buy,
         allow_single_sided: true,
         respect_reward_min_size: false,

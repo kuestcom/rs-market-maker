@@ -62,7 +62,8 @@ Live mode also checks open orders and balances before posting. It subtracts
 collateral already locked by live buy orders, checks sell orders against
 available outcome-token balance, respects configured collateral caps, and
 blocks quotes whose simulated fill would exceed the configured market loss cap.
-It also requires a two-sided book by default before quoting.
+It also requires a two-sided book with acceptable spread and top-of-book depth
+before quoting.
 
 ## CLI args / env vars
 
@@ -134,6 +135,18 @@ It also requires a two-sided book by default before quoting.
   Default: 2.
   Minimum spread between the bot’s buy and sell quotes, in ticks. Necessary
   to avoid placing a too-tight two-sided market.
+
+  --max-book-spread-ticks / MARKET_MAKER_MAX_BOOK_SPREAD_TICKS
+  Default: 20.
+  In live mode, skip tokens when best ask minus best bid is wider than this
+  many ticks. Necessary because midpoint fair value is unreliable in wide
+  books.
+
+  --min-top-depth / MARKET_MAKER_MIN_TOP_DEPTH
+  Default: 5.
+  In live mode, skip tokens unless both best bid and best ask have at least
+  this much size at the top level. Necessary because tiny top levels can make
+  the visible midpoint too easy to manipulate.
 
   --quote-sides / MARKET_MAKER_QUOTE_SIDES
   Default: buy. Values: buy, sell, both.
