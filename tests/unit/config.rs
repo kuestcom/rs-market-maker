@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use kuest_client_sdk::types::Decimal;
+use kuest_client_sdk::{AMOY, types::Decimal};
 use rs_market_maker::config::{Cli, DiscoveryMode, QuoteSides, validate_cli};
 use rust_decimal_macros::dec;
 
@@ -105,6 +105,37 @@ fn invalid_band_sizes_are_rejected() {
     assert!(error.to_string().contains("MARKET_MAKER_BAND_*_SIZE"));
 }
 
+#[test]
+fn cancel_all_requires_live_mode() {
+    let mut cli = valid_cli();
+    cli.cancel_all = true;
+
+    let error = validate_cli(&cli).expect_err("cancel all without live mode should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_CANCEL_ALL"));
+}
+
+#[test]
+fn cancel_all_on_exit_requires_live_mode() {
+    let mut cli = valid_cli();
+    cli.cancel_all_on_exit = true;
+
+    let error = validate_cli(&cli).expect_err("cancel all on exit without live mode should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_CANCEL_ALL"));
+}
+
+#[test]
+fn cancel_all_modes_are_mutually_exclusive() {
+    let mut cli = valid_live_cli();
+    cli.cancel_all = true;
+    cli.cancel_all_on_exit = true;
+
+    let error = validate_cli(&cli).expect_err("conflicting cancel modes should fail");
+
+    assert!(error.to_string().contains("mutually exclusive"));
+}
+
 fn valid_cli() -> Cli {
     Cli {
         clob_host: "https://clob.kuest.com".to_owned(),
@@ -131,6 +162,8 @@ fn valid_cli() -> Cli {
         allow_single_sided: true,
         respect_reward_min_size: false,
         cancel_before_quote: true,
+        cancel_all: false,
+        cancel_all_on_exit: false,
         post_only: true,
         require_two_sided_live: true,
         min_price: dec!(0.05),
@@ -145,4 +178,13 @@ fn valid_cli() -> Cli {
         refresh_secs: 30,
         state_path: PathBuf::from("state/seen-markets.json"),
     }
+}
+
+fn valid_live_cli() -> Cli {
+    let mut cli = valid_cli();
+    cli.live = true;
+    cli.private_key = Some("private-key".to_owned());
+    cli.deposit_wallet = Some("0x0000000000000000000000000000000000000001".to_owned());
+    cli.chain_id = Some(AMOY);
+    cli
 }

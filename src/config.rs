@@ -21,10 +21,10 @@ pub struct Cli {
     #[arg(long, env = "MARKET_MAKER_LIVE", default_value_t = false)]
     pub live: bool,
 
-    #[arg(long, env = "KUEST_PRIVATE_KEY")]
+    #[arg(long, env = "KUEST_PRIVATE_KEY", hide_env_values = true)]
     pub private_key: Option<String>,
 
-    #[arg(long, env = "KUEST_DEPOSIT_WALLET")]
+    #[arg(long, env = "KUEST_DEPOSIT_WALLET", hide_env_values = true)]
     pub deposit_wallet: Option<String>,
 
     #[arg(long, env = "KUEST_CHAIN_ID")]
@@ -90,6 +90,12 @@ pub struct Cli {
 
     #[arg(long, env = "MARKET_MAKER_CANCEL_BEFORE_QUOTE", default_value_t = true)]
     pub cancel_before_quote: bool,
+
+    #[arg(long, env = "MARKET_MAKER_CANCEL_ALL", default_value_t = false)]
+    pub cancel_all: bool,
+
+    #[arg(long, env = "MARKET_MAKER_CANCEL_ALL_ON_EXIT", default_value_t = false)]
+    pub cancel_all_on_exit: bool,
 
     #[arg(long, env = "MARKET_MAKER_POST_ONLY", default_value_t = true)]
     pub post_only: bool,
@@ -251,6 +257,12 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
         .is_some_and(|slug| slug.trim().is_empty())
     {
         bail!("MARKET_MAKER_EVENT_SLUG cannot be empty");
+    }
+    if cli.cancel_all && cli.cancel_all_on_exit {
+        bail!("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT are mutually exclusive");
+    }
+    if (cli.cancel_all || cli.cancel_all_on_exit) && !cli.live {
+        bail!("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live");
     }
     if cli.min_price <= Decimal::ZERO || cli.min_price >= Decimal::ONE {
         bail!("MARKET_MAKER_MIN_PRICE must be between 0 and 1");

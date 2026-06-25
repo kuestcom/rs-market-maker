@@ -16,4 +16,4 @@ rust_decimal = "1.40.0"
 rust_decimal_macros = "1.40.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
