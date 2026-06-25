@@ -258,6 +258,9 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     {
         bail!("MARKET_MAKER_EVENT_SLUG cannot be empty");
     }
+    if cli.cancel_all && cli.cancel_all_on_exit {
+        bail!("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT are mutually exclusive");
+    }
     if (cli.cancel_all || cli.cancel_all_on_exit) && !cli.live {
         bail!("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live");
     }

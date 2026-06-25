@@ -184,16 +184,17 @@ async fn scoped_cancel_markets(
     managed_scope: Option<ManagedScope>,
 ) -> Result<Vec<MarketResponse>> {
     if let Some(managed_scope) = managed_scope {
-        let managed_markets = managed_scope
-            .lock()
-            .map_err(|_| anyhow::anyhow!("managed market scope lock poisoned"))?
-            .clone();
-        if !managed_markets.is_empty() {
-            return Ok(managed_markets);
-        }
+        return managed_scope_markets(&managed_scope);
     }
 
     discover_cancel_markets(public_client, cli).await
+}
+
+fn managed_scope_markets(managed_scope: &ManagedScope) -> Result<Vec<MarketResponse>> {
+    managed_scope
+        .lock()
+        .map_err(|_| anyhow::anyhow!("managed market scope lock poisoned"))
+        .map(|managed_markets| managed_markets.clone())
 }
 
 async fn discover_cancel_markets(
@@ -211,7 +212,7 @@ async fn discover_cancel_markets(
     } else {
         println!("cancel-all: discovering scoped markets");
         let markets = discover_markets(public_client, cli.discovery, cli.max_pages).await?;
-        let mut seen = SeenMarkets::default();
+        let mut seen = SeenMarkets::load(&cli.state_path)?;
         Ok(select_candidates(markets, &mut seen, cli.max_markets)
             .into_iter()
             .map(|candidate| candidate.market)
@@ -253,4 +254,18 @@ async fn shutdown_signal() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_scope_snapshot_preserves_empty_scope() {
+        let managed_scope = Arc::new(Mutex::new(Vec::new()));
+
+        let markets = managed_scope_markets(&managed_scope).expect("managed scope should lock");
+
+        assert!(markets.is_empty());
+    }
 }
