@@ -8,7 +8,8 @@ use kuest_client_sdk::clob::types::request::{
     BalanceAllowanceRequest, OrderBookSummaryRequest, OrdersRequest,
 };
 use kuest_client_sdk::clob::types::response::{
-    MarketResponse, OpenOrderResponse, OrderBookSummaryResponse, PostOrderResponse, Token,
+    MarketResponse, OpenOrderResponse, OrderBookSummaryResponse, OrderSummary, PostOrderResponse,
+    Token,
 };
 use kuest_client_sdk::clob::types::{AssetType, OrderStatusType, OrderType, Side, SignatureType};
 use kuest_client_sdk::clob::{Client, Config};
@@ -80,6 +81,7 @@ struct TokenQuote {
     token_id: U256,
     fair_price: Decimal,
     plan: Option<QuotePlan>,
+    skip_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -121,6 +123,24 @@ struct OutcomeExposure {
 enum BuyTopUpDecision {
     Place { size: Decimal, collateral: Decimal },
     Skip { affordable_size: Decimal },
+}
+
+#[derive(Debug, PartialEq)]
+enum LiquidityRejectReason {
+    MissingTwoSidedBook,
+    InvalidTick,
+    SpreadTooWide {
+        spread_ticks: Decimal,
+        max_spread_ticks: u32,
+    },
+    BidDepthTooLow {
+        depth: Decimal,
+        min_depth: Decimal,
+    },
+    AskDepthTooLow {
+        depth: Decimal,
+        min_depth: Decimal,
+    },
 }
 
 pub(crate) async fn authenticate(cli: &Cli) -> Result<LiveTrading> {
@@ -175,8 +195,13 @@ pub(crate) async fn quote_market(
             print_plan(plan, cli.live);
         } else {
             println!(
-                "skip {} {}: no safe quote at configured edge/sides",
-                market.market_slug, token.outcome
+                "skip {} {}: {}",
+                market.market_slug,
+                token.outcome,
+                token_quote
+                    .skip_reason
+                    .as_deref()
+                    .unwrap_or("no safe quote at configured edge/sides")
             );
         }
 
@@ -209,15 +234,34 @@ fn build_token_quote(
     book: &OrderBookSummaryResponse,
     cli: &Cli,
 ) -> TokenQuote {
+    let fair_price = fair_price(
+        best_bid(&book.bids),
+        best_ask(&book.asks),
+        token.price,
+        book.last_trade_price,
+    );
+    let liquidity_skip = if should_enforce_liquidity_quality(cli) {
+        liquidity_quality_reject_reason(book, cli)
+            .map(|reason| format!("liquidity quality check failed: {}", reason.message()))
+    } else {
+        None
+    };
+    let plan = if liquidity_skip.is_none() {
+        build_quote_plan(market, token, book, cli)
+    } else {
+        None
+    };
+    let skip_reason = if plan.is_none() {
+        liquidity_skip.or_else(|| Some("no safe quote at configured edge/sides".to_owned()))
+    } else {
+        None
+    };
+
     TokenQuote {
         token_id: token.token_id,
-        fair_price: fair_price(
-            best_bid(&book.bids),
-            best_ask(&book.asks),
-            token.price,
-            book.last_trade_price,
-        ),
-        plan: build_quote_plan(market, token, book, cli),
+        fair_price,
+        plan,
+        skip_reason,
     }
 }
 
@@ -297,6 +341,95 @@ fn order_size(market: &MarketResponse, cli: &Cli) -> Decimal {
 
 fn price_in_configured_range(price: Decimal, cli: &Cli) -> bool {
     price >= cli.min_price && price <= cli.max_price
+}
+
+fn should_enforce_liquidity_quality(cli: &Cli) -> bool {
+    cli.live && cli.require_two_sided_live
+}
+
+fn liquidity_quality_reject_reason(
+    book: &OrderBookSummaryResponse,
+    cli: &Cli,
+) -> Option<LiquidityRejectReason> {
+    liquidity_reject_reason(
+        &book.bids,
+        &book.asks,
+        book.tick_size.as_decimal(),
+        cli.max_book_spread_ticks,
+        cli.min_top_depth,
+    )
+}
+
+fn liquidity_reject_reason(
+    bids: &[OrderSummary],
+    asks: &[OrderSummary],
+    tick: Decimal,
+    max_spread_ticks: u32,
+    min_top_depth: Decimal,
+) -> Option<LiquidityRejectReason> {
+    if tick <= Decimal::ZERO {
+        return Some(LiquidityRejectReason::InvalidTick);
+    }
+
+    let (Some(bid), Some(ask)) = (best_bid(bids), best_ask(asks)) else {
+        return Some(LiquidityRejectReason::MissingTwoSidedBook);
+    };
+    if bid <= Decimal::ZERO || ask <= bid {
+        return Some(LiquidityRejectReason::MissingTwoSidedBook);
+    }
+
+    let spread_ticks = (ask - bid) / tick;
+    if spread_ticks > Decimal::from(max_spread_ticks) {
+        return Some(LiquidityRejectReason::SpreadTooWide {
+            spread_ticks,
+            max_spread_ticks,
+        });
+    }
+
+    let bid_depth = top_depth(bids, bid);
+    if bid_depth < min_top_depth {
+        return Some(LiquidityRejectReason::BidDepthTooLow {
+            depth: bid_depth,
+            min_depth: min_top_depth,
+        });
+    }
+
+    let ask_depth = top_depth(asks, ask);
+    if ask_depth < min_top_depth {
+        return Some(LiquidityRejectReason::AskDepthTooLow {
+            depth: ask_depth,
+            min_depth: min_top_depth,
+        });
+    }
+
+    None
+}
+
+fn top_depth(levels: &[OrderSummary], price: Decimal) -> Decimal {
+    levels
+        .iter()
+        .filter(|level| level.price == price)
+        .map(|level| level.size)
+        .sum()
+}
+
+impl LiquidityRejectReason {
+    fn message(&self) -> String {
+        match self {
+            Self::MissingTwoSidedBook => "missing a valid two-sided book".to_owned(),
+            Self::InvalidTick => "book tick size is invalid".to_owned(),
+            Self::SpreadTooWide {
+                spread_ticks,
+                max_spread_ticks,
+            } => format!("spread is {spread_ticks} ticks above max {max_spread_ticks}"),
+            Self::BidDepthTooLow { depth, min_depth } => {
+                format!("best bid depth {depth} below minimum {min_depth}")
+            }
+            Self::AskDepthTooLow { depth, min_depth } => {
+                format!("best ask depth {depth} below minimum {min_depth}")
+            }
+        }
+    }
 }
 
 fn print_plan(plan: &QuotePlan, live: bool) {
@@ -896,7 +1029,11 @@ fn print_post_responses(plan: &QuotePlan, responses: &[(Side, PostOrderResponse)
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use rust_decimal_macros::dec;
+
+    use crate::config::{DiscoveryMode, QuoteSides};
 
     use super::*;
 
@@ -1027,5 +1164,118 @@ mod tests {
         }
 
         assert_eq!(exposure.worst_loss(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn liquidity_guard_follows_two_sided_live_flag() {
+        let mut cli = test_cli();
+        cli.live = true;
+        cli.require_two_sided_live = false;
+        assert!(!should_enforce_liquidity_quality(&cli));
+
+        cli.require_two_sided_live = true;
+        assert!(should_enforce_liquidity_quality(&cli));
+
+        cli.live = false;
+        assert!(!should_enforce_liquidity_quality(&cli));
+    }
+
+    #[test]
+    fn liquidity_rejects_missing_two_sided_book() {
+        let reason =
+            liquidity_reject_reason(&[level(dec!(0.49), dec!(10))], &[], dec!(0.01), 20, dec!(5));
+
+        assert_eq!(reason, Some(LiquidityRejectReason::MissingTwoSidedBook));
+    }
+
+    #[test]
+    fn liquidity_rejects_wide_book() {
+        let reason = liquidity_reject_reason(
+            &[level(dec!(0.40), dec!(10))],
+            &[level(dec!(0.70), dec!(10))],
+            dec!(0.01),
+            20,
+            dec!(5),
+        );
+
+        assert_eq!(
+            reason,
+            Some(LiquidityRejectReason::SpreadTooWide {
+                spread_ticks: dec!(30),
+                max_spread_ticks: 20
+            })
+        );
+    }
+
+    #[test]
+    fn liquidity_rejects_shallow_best_bid() {
+        let reason = liquidity_reject_reason(
+            &[level(dec!(0.49), dec!(4.9)), level(dec!(0.48), dec!(100))],
+            &[level(dec!(0.51), dec!(10))],
+            dec!(0.01),
+            20,
+            dec!(5),
+        );
+
+        assert_eq!(
+            reason,
+            Some(LiquidityRejectReason::BidDepthTooLow {
+                depth: dec!(4.9),
+                min_depth: dec!(5)
+            })
+        );
+    }
+
+    #[test]
+    fn liquidity_accepts_tight_book_with_enough_top_depth() {
+        let reason = liquidity_reject_reason(
+            &[level(dec!(0.49), dec!(2)), level(dec!(0.49), dec!(3))],
+            &[level(dec!(0.51), dec!(5))],
+            dec!(0.01),
+            20,
+            dec!(5),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    fn level(price: Decimal, size: Decimal) -> OrderSummary {
+        OrderSummary::builder().price(price).size(size).build()
+    }
+
+    fn test_cli() -> Cli {
+        Cli {
+            clob_host: "https://clob.kuest.com".to_owned(),
+            live: false,
+            private_key: None,
+            deposit_wallet: None,
+            chain_id: None,
+            discovery: DiscoveryMode::Auto,
+            event_slug: None,
+            max_markets: 3,
+            max_pages: 5,
+            order_size: dec!(5),
+            edge_ticks: 1,
+            min_spread_ticks: 2,
+            max_book_spread_ticks: 20,
+            min_top_depth: dec!(5),
+            quote_sides: QuoteSides::Buy,
+            allow_single_sided: true,
+            respect_reward_min_size: false,
+            cancel_before_quote: true,
+            post_only: true,
+            require_two_sided_live: true,
+            min_price: dec!(0.05),
+            max_price: dec!(0.95),
+            max_collateral_per_market: dec!(25),
+            max_loss_per_market: dec!(25),
+            max_total_collateral: dec!(50),
+            min_free_collateral: Decimal::ONE,
+            max_open_orders_per_token: 2,
+            discover_only: false,
+            cycles: 1,
+            refresh_secs: 30,
+            state_path: PathBuf::from("state/seen-markets.json"),
+        }
     }
 }

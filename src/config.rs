@@ -51,6 +51,12 @@ pub struct Cli {
     #[arg(long, env = "MARKET_MAKER_MIN_SPREAD_TICKS", default_value_t = 2)]
     pub min_spread_ticks: u32,
 
+    #[arg(long, env = "MARKET_MAKER_MAX_BOOK_SPREAD_TICKS", default_value_t = 20)]
+    pub max_book_spread_ticks: u32,
+
+    #[arg(long, env = "MARKET_MAKER_MIN_TOP_DEPTH", default_value = "5")]
+    pub min_top_depth: Decimal,
+
     #[arg(long, env = "MARKET_MAKER_QUOTE_SIDES", value_enum, default_value_t = QuoteSides::Buy)]
     pub quote_sides: QuoteSides,
 
@@ -162,6 +168,12 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.min_spread_ticks == 0 {
         bail!("MARKET_MAKER_MIN_SPREAD_TICKS must be greater than zero");
+    }
+    if cli.max_book_spread_ticks == 0 {
+        bail!("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero");
+    }
+    if cli.min_top_depth < Decimal::ZERO {
+        bail!("MARKET_MAKER_MIN_TOP_DEPTH cannot be negative");
     }
     if cli
         .event_slug
