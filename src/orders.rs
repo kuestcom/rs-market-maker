@@ -17,7 +17,7 @@ use kuest_client_sdk::types::{Address, Decimal, U256};
 
 use crate::config::Cli;
 use crate::discovery::market_key;
-use crate::pricing::{best_ask, best_bid, fair_price, max_decimal, min_decimal, quote_prices};
+use crate::pricing::{best_ask, best_bid, fair_price, max_decimal, min_decimal};
 use crate::{AuthClient, PublicClient};
 
 const TERMINAL_CURSOR: &str = "LTE=";
@@ -71,9 +71,19 @@ struct QuotePlan {
     fair_price: Decimal,
     best_bid: Option<Decimal>,
     best_ask: Option<Decimal>,
-    buy_price: Option<Decimal>,
-    sell_price: Option<Decimal>,
-    size: Decimal,
+    buy_band: Option<QuoteBand>,
+    sell_band: Option<QuoteBand>,
+}
+
+#[derive(Clone, Debug)]
+struct QuoteBand {
+    side: Side,
+    price: Decimal,
+    min_price: Decimal,
+    max_price: Decimal,
+    min_size: Decimal,
+    avg_size: Decimal,
+    max_size: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -282,37 +292,39 @@ fn build_quote_plan(
 
     let fair_price = fair_price(best_bid, best_ask, token.price, book.last_trade_price);
     let tick = book.tick_size.as_decimal();
-    let (mut buy_price, mut sell_price) = quote_prices(
-        fair_price,
-        best_bid,
-        best_ask,
-        tick,
-        cli.edge_ticks,
-        cli.min_spread_ticks,
-    );
+    let mut buy_band = cli
+        .quote_sides
+        .includes_buy()
+        .then(|| build_quote_band(market, Side::Buy, fair_price, best_bid, best_ask, tick, cli))
+        .flatten();
+    let mut sell_band = cli
+        .quote_sides
+        .includes_sell()
+        .then(|| {
+            build_quote_band(
+                market,
+                Side::Sell,
+                fair_price,
+                best_bid,
+                best_ask,
+                tick,
+                cli,
+            )
+        })
+        .flatten();
 
-    if !cli.quote_sides.includes_buy() {
-        buy_price = None;
-    }
-    if !cli.quote_sides.includes_sell() {
-        sell_price = None;
-    }
-
-    buy_price = buy_price.filter(|price| price_in_configured_range(*price, cli));
-    sell_price = sell_price.filter(|price| price_in_configured_range(*price, cli));
-
-    if !cli.allow_single_sided && (buy_price.is_none() || sell_price.is_none()) {
+    if !cli.allow_single_sided && (buy_band.is_none() || sell_band.is_none()) {
         return None;
     }
 
-    if let (Some(buy), Some(sell)) = (buy_price, sell_price)
-        && buy >= sell
+    if let (Some(buy), Some(sell)) = (&buy_band, &sell_band)
+        && sell.price - buy.price < tick * Decimal::from(cli.min_spread_ticks)
     {
-        buy_price = None;
-        sell_price = None;
+        buy_band = None;
+        sell_band = None;
     }
 
-    if buy_price.is_none() && sell_price.is_none() {
+    if buy_band.is_none() && sell_band.is_none() {
         return None;
     }
 
@@ -325,14 +337,72 @@ fn build_quote_plan(
         fair_price,
         best_bid,
         best_ask,
-        buy_price,
-        sell_price,
-        size: order_size(market, cli),
+        buy_band,
+        sell_band,
     })
 }
 
-fn order_size(market: &MarketResponse, cli: &Cli) -> Decimal {
-    let mut size = max_decimal(cli.order_size, market.minimum_order_size);
+fn build_quote_band(
+    market: &MarketResponse,
+    side: Side,
+    fair_price: Decimal,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+    tick: Decimal,
+    cli: &Cli,
+) -> Option<QuoteBand> {
+    if tick <= Decimal::ZERO {
+        return None;
+    }
+
+    let (min_margin_ticks, avg_margin_ticks, max_margin_ticks) = cli.band_margin_ticks();
+    let (min_size, avg_size, max_size) = cli.band_sizes();
+    let min_margin = tick * Decimal::from(min_margin_ticks);
+    let avg_margin = tick * Decimal::from(avg_margin_ticks);
+    let max_margin = tick * Decimal::from(max_margin_ticks);
+
+    let (price, min_price, max_price) = match side {
+        Side::Buy => (
+            floor_to_tick(fair_price - avg_margin, tick),
+            floor_to_tick(fair_price - max_margin, tick),
+            floor_to_tick(fair_price - min_margin, tick),
+        ),
+        Side::Sell => (
+            ceil_to_tick(fair_price + avg_margin, tick),
+            ceil_to_tick(fair_price + min_margin, tick),
+            ceil_to_tick(fair_price + max_margin, tick),
+        ),
+        _ => return None,
+    };
+    let min_price = max_decimal(max_decimal(min_price, tick), cli.min_price);
+    let max_price = min_decimal(min_decimal(max_price, Decimal::ONE - tick), cli.max_price);
+
+    if !is_tradeable_price(price, tick) || !price_in_configured_range(price, cli) {
+        return None;
+    }
+    if min_price > max_price {
+        return None;
+    }
+    if side == Side::Buy && best_ask.is_some_and(|ask| price >= ask) {
+        return None;
+    }
+    if side == Side::Sell && best_bid.is_some_and(|bid| price <= bid) {
+        return None;
+    }
+
+    Some(QuoteBand {
+        side,
+        price,
+        min_price,
+        max_price,
+        min_size: order_size(market, min_size, cli),
+        avg_size: order_size(market, avg_size, cli),
+        max_size: order_size(market, max_size, cli),
+    })
+}
+
+fn order_size(market: &MarketResponse, requested_size: Decimal, cli: &Cli) -> Decimal {
+    let mut size = max_decimal(requested_size, market.minimum_order_size);
     if cli.respect_reward_min_size {
         size = max_decimal(size, market.rewards.min_size);
     }
@@ -341,6 +411,18 @@ fn order_size(market: &MarketResponse, cli: &Cli) -> Decimal {
 
 fn price_in_configured_range(price: Decimal, cli: &Cli) -> bool {
     price >= cli.min_price && price <= cli.max_price
+}
+
+fn is_tradeable_price(price: Decimal, tick: Decimal) -> bool {
+    price >= tick && price <= Decimal::ONE - tick
+}
+
+fn floor_to_tick(price: Decimal, tick: Decimal) -> Decimal {
+    (price / tick).floor() * tick
+}
+
+fn ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal {
+    (price / tick).ceil() * tick
 }
 
 fn should_enforce_liquidity_quality(cli: &Cli) -> bool {
@@ -435,7 +517,7 @@ impl LiquidityRejectReason {
 fn print_plan(plan: &QuotePlan, live: bool) {
     let mode = if live { "live" } else { "dry-run" };
     println!(
-        "{mode}: {} :: {} :: {} :: {} ({}) fair={} bid={:?} ask={:?} buy={:?} sell={:?} size={}",
+        "{mode}: {} :: {} :: {} :: {} ({}) fair={} bid={:?} ask={:?} buy={} sell={}",
         plan.market_key,
         plan.market_slug,
         plan.question,
@@ -444,10 +526,19 @@ fn print_plan(plan: &QuotePlan, live: bool) {
         plan.fair_price,
         plan.best_bid,
         plan.best_ask,
-        plan.buy_price,
-        plan.sell_price,
-        plan.size
+        format_band(plan.buy_band.as_ref()),
+        format_band(plan.sell_band.as_ref())
     );
+}
+
+fn format_band(band: Option<&QuoteBand>) -> String {
+    band.map(|band| {
+        format!(
+            "price={} band=[{}, {}] size={}/{}/{}",
+            band.price, band.min_price, band.max_price, band.min_size, band.avg_size, band.max_size
+        )
+    })
+    .unwrap_or_else(|| "none".to_owned())
 }
 
 async fn reconcile_quote_plan(
@@ -528,15 +619,14 @@ async fn reconcile_quote_plan(
         .saturating_sub(kept_order_count);
 
     let mut orders = Vec::new();
-    if let Some(price) = plan.buy_price
+    if let Some(band) = &plan.buy_band
         && new_order_slots > 0
     {
-        let open_size = matching_open_size(&remaining_orders, Side::Buy, price);
-        if open_size < plan.size {
-            let missing_size = plan.size - open_size;
+        let open_size = band_open_size(&remaining_orders, band);
+        if let Some(missing_size) = band_missing_size(band, open_size) {
             match buy_top_up_decision(
                 missing_size,
-                price,
+                band.price,
                 free_collateral,
                 global_budget,
                 market_budget,
@@ -545,7 +635,7 @@ async fn reconcile_quote_plan(
                     let proposed_order = ProposedOrder {
                         token_id: plan.token_id,
                         side: Side::Buy,
-                        price,
+                        price: band.price,
                         size,
                     };
                     if !market_loss_exceeds_cap(plan, proposed_order, market_state, cli)? {
@@ -554,7 +644,7 @@ async fn reconcile_quote_plan(
                             .limit_order()
                             .token_id(plan.token_id)
                             .side(Side::Buy)
-                            .price(price)
+                            .price(band.price)
                             .size(size)
                             .order_type(OrderType::GTC)
                             .post_only(cli.post_only)
@@ -571,7 +661,7 @@ async fn reconcile_quote_plan(
                 }
                 BuyTopUpDecision::Skip { affordable_size } => {
                     println!(
-                        "skip {} {} buy: risk budget/free collateral leaves size {} below required {}",
+                        "skip {} {} buy: risk budget/free collateral leaves size {} below band target {}",
                         plan.market_slug, plan.outcome, affordable_size, missing_size
                     );
                 }
@@ -579,18 +669,17 @@ async fn reconcile_quote_plan(
         }
     }
 
-    if let Some(price) = plan.sell_price
+    if let Some(band) = &plan.sell_band
         && new_order_slots > 0
     {
-        let open_size = matching_open_size(&remaining_orders, Side::Sell, price);
-        if open_size < plan.size {
-            let missing_size = plan.size - open_size;
+        let open_size = band_open_size(&remaining_orders, band);
+        if let Some(missing_size) = band_missing_size(band, open_size) {
             let size = min_decimal(missing_size, free_tokens);
             if size >= missing_size {
                 let proposed_order = ProposedOrder {
                     token_id: plan.token_id,
                     side: Side::Sell,
-                    price,
+                    price: band.price,
                     size,
                 };
                 if !market_loss_exceeds_cap(plan, proposed_order, market_state, cli)? {
@@ -599,7 +688,7 @@ async fn reconcile_quote_plan(
                         .limit_order()
                         .token_id(plan.token_id)
                         .side(Side::Sell)
-                        .price(price)
+                        .price(band.price)
                         .size(size)
                         .order_type(OrderType::GTC)
                         .post_only(cli.post_only)
@@ -613,7 +702,7 @@ async fn reconcile_quote_plan(
                 }
             } else {
                 println!(
-                    "skip {} {} sell: free token balance leaves size {} below required {}",
+                    "skip {} {} sell: free token balance leaves size {} below band target {}",
                     plan.market_slug, plan.outcome, size, missing_size
                 );
             }
@@ -939,25 +1028,34 @@ fn cancellable_orders<'a>(
         .map(|order| order.id.as_str())
         .collect::<BTreeSet<_>>();
 
-    for (side, target_price) in [(Side::Buy, plan.buy_price), (Side::Sell, plan.sell_price)] {
-        let Some(target_price) = target_price else {
-            continue;
-        };
+    for band in plan.bands() {
         let matching_orders = open_orders
             .iter()
             .filter(|order| {
-                !cancellable_ids.contains(order.id.as_str())
-                    && order.side == side
-                    && order.price == target_price
+                !cancellable_ids.contains(order.id.as_str()) && band.includes_order(order)
             })
             .collect::<Vec<_>>();
         let matching_size = matching_orders
             .iter()
             .map(|order| open_order_remaining_size(order))
             .sum::<Decimal>();
-        if matching_size > plan.size {
-            for order in matching_orders {
+        if matching_size > band.max_size {
+            let mut band_amount = matching_size;
+            let mut excessive_orders = matching_orders;
+            excessive_orders.sort_by(|left, right| {
+                band.cancel_priority(left)
+                    .cmp(&band.cancel_priority(right))
+                    .then_with(|| left.created_at.cmp(&right.created_at))
+            });
+            for order in excessive_orders {
+                if band_amount <= band.avg_size {
+                    break;
+                }
                 if cancellable_ids.insert(order.id.as_str()) {
+                    band_amount = max_decimal(
+                        band_amount - open_order_remaining_size(order),
+                        Decimal::ZERO,
+                    );
                     cancellable.push(order);
                 }
             }
@@ -987,19 +1085,56 @@ fn order_should_cancel(order: &OpenOrderResponse, plan: &QuotePlan) -> bool {
     }
 
     match order.side {
-        Side::Buy => plan.buy_price != Some(order.price),
-        Side::Sell => plan.sell_price != Some(order.price),
+        Side::Buy => !plan
+            .buy_band
+            .as_ref()
+            .is_some_and(|band| band.includes_order(order)),
+        Side::Sell => !plan
+            .sell_band
+            .as_ref()
+            .is_some_and(|band| band.includes_order(order)),
         Side::Unknown => true,
         _ => true,
     }
 }
 
-fn matching_open_size(orders: &[&OpenOrderResponse], side: Side, price: Decimal) -> Decimal {
+impl QuotePlan {
+    fn bands(&self) -> impl Iterator<Item = &QuoteBand> {
+        self.buy_band.iter().chain(self.sell_band.iter())
+    }
+}
+
+impl QuoteBand {
+    fn contains_price(&self, price: Decimal) -> bool {
+        match self.side {
+            Side::Buy | Side::Sell => price >= self.min_price && price <= self.max_price,
+            _ => false,
+        }
+    }
+
+    fn includes_order(&self, order: &OpenOrderResponse) -> bool {
+        order.side == self.side && self.contains_price(order.price)
+    }
+
+    fn cancel_priority(&self, order: &OpenOrderResponse) -> Decimal {
+        match self.side {
+            Side::Buy => max_decimal(self.max_price - order.price, Decimal::ZERO),
+            Side::Sell => max_decimal(order.price - self.min_price, Decimal::ZERO),
+            _ => Decimal::ZERO,
+        }
+    }
+}
+
+fn band_open_size(orders: &[&OpenOrderResponse], band: &QuoteBand) -> Decimal {
     orders
         .iter()
-        .filter(|order| order.side == side && order.price == price)
+        .filter(|order| band.includes_order(order))
         .map(|order| open_order_remaining_size(order))
         .sum()
+}
+
+fn band_missing_size(band: &QuoteBand, open_size: Decimal) -> Option<Decimal> {
+    (open_size < band.min_size).then(|| max_decimal(band.avg_size - open_size, Decimal::ZERO))
 }
 
 fn open_order_remaining_size(order: &OpenOrderResponse) -> Decimal {
@@ -1239,6 +1374,42 @@ mod tests {
         assert_eq!(reason, None);
     }
 
+    #[test]
+    fn quote_band_contains_configured_price_range() {
+        let band = QuoteBand {
+            side: Side::Buy,
+            price: dec!(0.49),
+            min_price: dec!(0.47),
+            max_price: dec!(0.49),
+            min_size: dec!(5),
+            avg_size: dec!(10),
+            max_size: dec!(15),
+        };
+
+        assert!(band.contains_price(dec!(0.47)));
+        assert!(band.contains_price(dec!(0.48)));
+        assert!(band.contains_price(dec!(0.49)));
+        assert!(!band.contains_price(dec!(0.46)));
+        assert!(!band.contains_price(dec!(0.50)));
+    }
+
+    #[test]
+    fn band_missing_size_targets_average_only_below_minimum() {
+        let band = QuoteBand {
+            side: Side::Buy,
+            price: dec!(0.49),
+            min_price: dec!(0.47),
+            max_price: dec!(0.49),
+            min_size: dec!(5),
+            avg_size: dec!(10),
+            max_size: dec!(15),
+        };
+
+        assert_eq!(band_missing_size(&band, dec!(4)), Some(dec!(6)));
+        assert_eq!(band_missing_size(&band, dec!(5)), None);
+        assert_eq!(band_missing_size(&band, dec!(9)), None);
+    }
+
     fn level(price: Decimal, size: Decimal) -> OrderSummary {
         OrderSummary::builder().price(price).size(size).build()
     }
@@ -1257,6 +1428,12 @@ mod tests {
             order_size: dec!(5),
             edge_ticks: 1,
             min_spread_ticks: 2,
+            band_min_margin_ticks: None,
+            band_avg_margin_ticks: None,
+            band_max_margin_ticks: None,
+            band_min_size: None,
+            band_avg_size: None,
+            band_max_size: None,
             max_book_spread_ticks: 20,
             min_top_depth: dec!(5),
             quote_sides: QuoteSides::Buy,

@@ -77,6 +77,34 @@ fn negative_top_depth_is_rejected() {
     assert!(error.to_string().contains("MARKET_MAKER_MIN_TOP_DEPTH"));
 }
 
+#[test]
+fn invalid_band_margins_are_rejected() {
+    let mut cli = valid_cli();
+    cli.band_min_margin_ticks = Some(4);
+    cli.band_avg_margin_ticks = Some(3);
+    cli.band_max_margin_ticks = Some(5);
+
+    let error = validate_cli(&cli).expect_err("invalid band margins should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_BAND_*_MARGIN_TICKS")
+    );
+}
+
+#[test]
+fn invalid_band_sizes_are_rejected() {
+    let mut cli = valid_cli();
+    cli.band_min_size = Some(dec!(10));
+    cli.band_avg_size = Some(dec!(5));
+    cli.band_max_size = Some(dec!(10));
+
+    let error = validate_cli(&cli).expect_err("invalid band sizes should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_BAND_*_SIZE"));
+}
+
 fn valid_cli() -> Cli {
     Cli {
         clob_host: "https://clob.kuest.com".to_owned(),
@@ -91,6 +119,12 @@ fn valid_cli() -> Cli {
         order_size: dec!(5),
         edge_ticks: 1,
         min_spread_ticks: 2,
+        band_min_margin_ticks: None,
+        band_avg_margin_ticks: None,
+        band_max_margin_ticks: None,
+        band_min_size: None,
+        band_avg_size: None,
+        band_max_size: None,
         max_book_spread_ticks: 20,
         min_top_depth: dec!(5),
         quote_sides: QuoteSides::Buy,
