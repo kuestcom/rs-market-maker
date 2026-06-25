@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::str::FromStr as _;
+use std::time::Duration;
 
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use anyhow::{Context as _, Result};
@@ -14,6 +15,7 @@ use kuest_client_sdk::clob::types::response::{
 use kuest_client_sdk::clob::types::{AssetType, OrderStatusType, OrderType, Side, SignatureType};
 use kuest_client_sdk::clob::{Client, Config};
 use kuest_client_sdk::types::{Address, Decimal, U256};
+use tokio::time::sleep;
 
 use crate::config::Cli;
 use crate::discovery::market_key;
@@ -21,10 +23,23 @@ use crate::pricing::{best_ask, best_bid, fair_price, max_decimal, min_decimal};
 use crate::{AuthClient, PublicClient};
 
 const TERMINAL_CURSOR: &str = "LTE=";
+const CANCEL_ORDER_BATCH_SIZE: usize = 50;
+const CANCEL_VERIFY_ATTEMPTS: usize = 5;
+const CANCEL_VERIFY_DELAY_SECS: u64 = 2;
 
 pub(crate) struct LiveTrading {
     client: AuthClient,
     signer: PrivateKeySigner,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CancelOpenOrdersSummary {
+    pub(crate) markets_checked: usize,
+    pub(crate) tokens_checked: usize,
+    pub(crate) orders_found: usize,
+    pub(crate) canceled: usize,
+    pub(crate) not_canceled: usize,
+    pub(crate) remaining_open: usize,
 }
 
 pub(crate) struct RiskBudget {
@@ -750,6 +765,91 @@ async fn open_orders_for_token(
     Ok(orders)
 }
 
+pub(crate) async fn cancel_open_orders_for_markets(
+    live: &LiveTrading,
+    markets: &[MarketResponse],
+) -> Result<CancelOpenOrdersSummary> {
+    let token_ids = managed_token_ids(markets);
+    let mut summary = CancelOpenOrdersSummary {
+        markets_checked: markets.len(),
+        tokens_checked: token_ids.len(),
+        ..Default::default()
+    };
+
+    for token_id in &token_ids {
+        let open_orders = open_orders_for_token(live, *token_id).await?;
+        if open_orders.is_empty() {
+            continue;
+        }
+
+        println!(
+            "cancel-all: token {} has {} open orders",
+            token_id,
+            open_orders.len()
+        );
+        summary.orders_found += open_orders.len();
+
+        for batch in open_orders.chunks(CANCEL_ORDER_BATCH_SIZE) {
+            let order_ids = batch
+                .iter()
+                .map(|order| order.id.as_str())
+                .collect::<Vec<_>>();
+            let response = live
+                .client
+                .cancel_orders(&order_ids)
+                .await
+                .with_context(|| format!("failed to cancel open orders for token {token_id}"))?;
+            summary.canceled += response.canceled.len();
+            summary.not_canceled += response.not_canceled.len();
+
+            println!(
+                "cancel-all: token {} canceled={} not_canceled={}",
+                token_id,
+                response.canceled.len(),
+                response.not_canceled.len()
+            );
+        }
+    }
+
+    if summary.orders_found > 0 {
+        for attempt in 1..=CANCEL_VERIFY_ATTEMPTS {
+            summary.remaining_open = remaining_open_orders_for_tokens(live, &token_ids).await?;
+            if summary.remaining_open == 0 {
+                break;
+            }
+            if attempt < CANCEL_VERIFY_ATTEMPTS {
+                println!(
+                    "cancel-all: waiting for {} open orders to clear (attempt {}/{})",
+                    summary.remaining_open, attempt, CANCEL_VERIFY_ATTEMPTS
+                );
+                sleep(Duration::from_secs(CANCEL_VERIFY_DELAY_SECS)).await;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn managed_token_ids(markets: &[MarketResponse]) -> Vec<U256> {
+    let mut token_ids = Vec::new();
+    for market in markets {
+        for token in &market.tokens {
+            if !token_ids.contains(&token.token_id) {
+                token_ids.push(token.token_id);
+            }
+        }
+    }
+    token_ids
+}
+
+async fn remaining_open_orders_for_tokens(live: &LiveTrading, token_ids: &[U256]) -> Result<usize> {
+    let mut remaining = 0;
+    for token_id in token_ids {
+        remaining += open_orders_for_token(live, *token_id).await?.len();
+    }
+    Ok(remaining)
+}
+
 impl LiveMarketState {
     async fn load(live: &LiveTrading, token_quotes: &[TokenQuote]) -> Result<Self> {
         let mut tokens = Vec::new();
@@ -1440,6 +1540,8 @@ mod tests {
             allow_single_sided: true,
             respect_reward_min_size: false,
             cancel_before_quote: true,
+            cancel_all: false,
+            cancel_all_on_exit: false,
             post_only: true,
             require_two_sided_live: true,
             min_price: dec!(0.05),

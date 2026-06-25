@@ -105,6 +105,26 @@ fn invalid_band_sizes_are_rejected() {
     assert!(error.to_string().contains("MARKET_MAKER_BAND_*_SIZE"));
 }
 
+#[test]
+fn cancel_all_requires_live_mode() {
+    let mut cli = valid_cli();
+    cli.cancel_all = true;
+
+    let error = validate_cli(&cli).expect_err("cancel all without live mode should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_CANCEL_ALL"));
+}
+
+#[test]
+fn cancel_all_on_exit_requires_live_mode() {
+    let mut cli = valid_cli();
+    cli.cancel_all_on_exit = true;
+
+    let error = validate_cli(&cli).expect_err("cancel all on exit without live mode should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_CANCEL_ALL"));
+}
+
 fn valid_cli() -> Cli {
     Cli {
         clob_host: "https://clob.kuest.com".to_owned(),
@@ -131,6 +151,8 @@ fn valid_cli() -> Cli {
         allow_single_sided: true,
         respect_reward_min_size: false,
         cancel_before_quote: true,
+        cancel_all: false,
+        cancel_all_on_exit: false,
         post_only: true,
         require_two_sided_live: true,
         min_price: dec!(0.05),

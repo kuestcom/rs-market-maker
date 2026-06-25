@@ -66,6 +66,22 @@ blocks quotes whose simulated fill would exceed the configured market loss cap.
 By default, it also requires a two-sided book with acceptable spread and
 top-of-book depth before quoting.
 
+To cancel scoped live orders without quoting, run:
+
+```bash
+cargo run -- --live --cancel-all
+```
+
+To cancel scoped live orders when the process receives Ctrl-C or SIGTERM, run:
+
+```bash
+cargo run -- --live --cancel-all-on-exit --cycles 1000
+```
+
+Both commands only target orders in the currently configured scope. With
+`--event-slug`, that scope is the event's selected markets; otherwise it is the
+normal discovery selection.
+
 ## CLI args / env vars
 
 ```md
@@ -197,6 +213,18 @@ top-of-book depth before quoting.
   Default: true.
   Cancels your existing orders for the token before posting fresh quotes.
   Necessary to avoid stacking duplicate stale orders on the same token.
+
+  --cancel-all / MARKET_MAKER_CANCEL_ALL
+  Default: false.
+  Live-only one-shot command. Discovers the configured market scope, cancels
+  open orders for its outcome tokens, waits briefly for them to clear, then
+  exits. Necessary for emergency cleanup without posting new quotes.
+
+  --cancel-all-on-exit / MARKET_MAKER_CANCEL_ALL_ON_EXIT
+  Default: false.
+  Live-only shutdown guard. On Ctrl-C or SIGTERM, cancels open orders for the
+  markets currently managed by this process and verifies whether any remain.
+  Necessary when you do not want interrupted runs to leave stale GTC orders.
 
   --post-only / MARKET_MAKER_POST_ONLY
   Default: true.
