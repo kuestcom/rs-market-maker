@@ -240,7 +240,7 @@ fn build_token_quote(
         token.price,
         book.last_trade_price,
     );
-    let liquidity_skip = if cli.live {
+    let liquidity_skip = if should_enforce_liquidity_quality(cli) {
         liquidity_quality_reject_reason(book, cli)
             .map(|reason| format!("liquidity quality check failed: {}", reason.message()))
     } else {
@@ -341,6 +341,10 @@ fn order_size(market: &MarketResponse, cli: &Cli) -> Decimal {
 
 fn price_in_configured_range(price: Decimal, cli: &Cli) -> bool {
     price >= cli.min_price && price <= cli.max_price
+}
+
+fn should_enforce_liquidity_quality(cli: &Cli) -> bool {
+    cli.live && cli.require_two_sided_live
 }
 
 fn liquidity_quality_reject_reason(
@@ -1025,7 +1029,11 @@ fn print_post_responses(plan: &QuotePlan, responses: &[(Side, PostOrderResponse)
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use rust_decimal_macros::dec;
+
+    use crate::config::{DiscoveryMode, QuoteSides};
 
     use super::*;
 
@@ -1159,6 +1167,20 @@ mod tests {
     }
 
     #[test]
+    fn liquidity_guard_follows_two_sided_live_flag() {
+        let mut cli = test_cli();
+        cli.live = true;
+        cli.require_two_sided_live = false;
+        assert!(!should_enforce_liquidity_quality(&cli));
+
+        cli.require_two_sided_live = true;
+        assert!(should_enforce_liquidity_quality(&cli));
+
+        cli.live = false;
+        assert!(!should_enforce_liquidity_quality(&cli));
+    }
+
+    #[test]
     fn liquidity_rejects_missing_two_sided_book() {
         let reason =
             liquidity_reject_reason(&[level(dec!(0.49), dec!(10))], &[], dec!(0.01), 20, dec!(5));
@@ -1219,5 +1241,41 @@ mod tests {
 
     fn level(price: Decimal, size: Decimal) -> OrderSummary {
         OrderSummary::builder().price(price).size(size).build()
+    }
+
+    fn test_cli() -> Cli {
+        Cli {
+            clob_host: "https://clob.kuest.com".to_owned(),
+            live: false,
+            private_key: None,
+            deposit_wallet: None,
+            chain_id: None,
+            discovery: DiscoveryMode::Auto,
+            event_slug: None,
+            max_markets: 3,
+            max_pages: 5,
+            order_size: dec!(5),
+            edge_ticks: 1,
+            min_spread_ticks: 2,
+            max_book_spread_ticks: 20,
+            min_top_depth: dec!(5),
+            quote_sides: QuoteSides::Buy,
+            allow_single_sided: true,
+            respect_reward_min_size: false,
+            cancel_before_quote: true,
+            post_only: true,
+            require_two_sided_live: true,
+            min_price: dec!(0.05),
+            max_price: dec!(0.95),
+            max_collateral_per_market: dec!(25),
+            max_loss_per_market: dec!(25),
+            max_total_collateral: dec!(50),
+            min_free_collateral: Decimal::ONE,
+            max_open_orders_per_token: 2,
+            discover_only: false,
+            cycles: 1,
+            refresh_secs: 30,
+            state_path: PathBuf::from("state/seen-markets.json"),
+        }
     }
 }
