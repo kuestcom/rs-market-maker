@@ -51,6 +51,24 @@ pub struct Cli {
     #[arg(long, env = "MARKET_MAKER_MIN_SPREAD_TICKS", default_value_t = 2)]
     pub min_spread_ticks: u32,
 
+    #[arg(long, env = "MARKET_MAKER_BAND_MIN_MARGIN_TICKS")]
+    pub band_min_margin_ticks: Option<u32>,
+
+    #[arg(long, env = "MARKET_MAKER_BAND_AVG_MARGIN_TICKS")]
+    pub band_avg_margin_ticks: Option<u32>,
+
+    #[arg(long, env = "MARKET_MAKER_BAND_MAX_MARGIN_TICKS")]
+    pub band_max_margin_ticks: Option<u32>,
+
+    #[arg(long, env = "MARKET_MAKER_BAND_MIN_SIZE")]
+    pub band_min_size: Option<Decimal>,
+
+    #[arg(long, env = "MARKET_MAKER_BAND_AVG_SIZE")]
+    pub band_avg_size: Option<Decimal>,
+
+    #[arg(long, env = "MARKET_MAKER_BAND_MAX_SIZE")]
+    pub band_max_size: Option<Decimal>,
+
     #[arg(long, env = "MARKET_MAKER_MAX_BOOK_SPREAD_TICKS", default_value_t = 20)]
     pub max_book_spread_ticks: u32,
 
@@ -153,6 +171,36 @@ impl QuoteSides {
     }
 }
 
+impl Cli {
+    pub(crate) fn band_margin_ticks(&self) -> (u32, u32, u32) {
+        let min_margin = self.band_min_margin_ticks.unwrap_or(self.edge_ticks);
+        let avg_margin = self.band_avg_margin_ticks.unwrap_or(min_margin);
+        let max_margin = self
+            .band_max_margin_ticks
+            .unwrap_or(min_margin.saturating_add(self.min_spread_ticks));
+
+        (min_margin, avg_margin, max_margin)
+    }
+
+    pub(crate) fn band_sizes(&self) -> (Decimal, Decimal, Decimal) {
+        let min_size = self.band_min_size.unwrap_or(self.order_size);
+        let default_avg_size = if self.order_size > min_size {
+            self.order_size
+        } else {
+            min_size
+        };
+        let avg_size = self.band_avg_size.unwrap_or(default_avg_size);
+        let default_max_size = if avg_size > min_size {
+            avg_size
+        } else {
+            min_size
+        };
+        let max_size = self.band_max_size.unwrap_or(default_max_size);
+
+        (min_size, avg_size, max_size)
+    }
+}
+
 pub fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.max_markets == 0 {
         bail!("MARKET_MAKER_MAX_MARKETS must be greater than zero");
@@ -168,6 +216,28 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.min_spread_ticks == 0 {
         bail!("MARKET_MAKER_MIN_SPREAD_TICKS must be greater than zero");
+    }
+    let (band_min_margin, band_avg_margin, band_max_margin) = cli.band_margin_ticks();
+    if band_min_margin == 0 || band_avg_margin == 0 || band_max_margin == 0 {
+        bail!("MARKET_MAKER_BAND_*_MARGIN_TICKS must be greater than zero");
+    }
+    if band_min_margin > band_avg_margin || band_avg_margin > band_max_margin {
+        bail!("MARKET_MAKER_BAND_*_MARGIN_TICKS must satisfy min <= avg <= max");
+    }
+    if band_min_margin >= band_max_margin {
+        bail!(
+            "MARKET_MAKER_BAND_MAX_MARGIN_TICKS must be greater than MARKET_MAKER_BAND_MIN_MARGIN_TICKS"
+        );
+    }
+    let (band_min_size, band_avg_size, band_max_size) = cli.band_sizes();
+    if band_min_size < Decimal::ZERO
+        || band_avg_size <= Decimal::ZERO
+        || band_max_size <= Decimal::ZERO
+    {
+        bail!("MARKET_MAKER_BAND_*_SIZE must be non-negative with avg and max greater than zero");
+    }
+    if band_min_size > band_avg_size || band_avg_size > band_max_size {
+        bail!("MARKET_MAKER_BAND_*_SIZE must satisfy min <= avg <= max");
     }
     if cli.max_book_spread_ticks == 0 {
         bail!("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero");
