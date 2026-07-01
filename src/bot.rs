@@ -110,13 +110,13 @@ async fn run_cycles(
             continue;
         }
 
-        if let Some(live) = live {
+        let mut risk_budget = if let Some(live) = live {
             let markets = candidates
                 .iter()
                 .map(|candidate| candidate.market.clone())
                 .collect::<Vec<_>>();
             match preflight_risk_audit(public_client, live, &markets, cli).await? {
-                PreflightRiskAuditResult::Continue => {}
+                PreflightRiskAuditResult::Continue(risk_budget) => risk_budget,
                 PreflightRiskAuditResult::SkipCycle => {
                     if cycle < cli.cycles {
                         sleep(Duration::from_secs(cli.refresh_secs)).await;
@@ -125,9 +125,10 @@ async fn run_cycles(
                 }
                 PreflightRiskAuditResult::Stop => return Ok(()),
             }
-        }
+        } else {
+            RiskBudget::new(cli.max_total_collateral)
+        };
 
-        let mut risk_budget = RiskBudget::new(cli.max_total_collateral);
         for candidate in candidates {
             quote_market(
                 public_client,

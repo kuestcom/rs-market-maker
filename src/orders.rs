@@ -50,9 +50,8 @@ pub(crate) struct RiskBudget {
     counted_open_buy_orders: BTreeSet<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreflightRiskAuditResult {
-    Continue,
+    Continue(RiskBudget),
     SkipCycle,
     Stop,
 }
@@ -62,6 +61,19 @@ impl RiskBudget {
         Self {
             remaining_collateral: max_decimal(collateral_limit, Decimal::ZERO),
             counted_open_buy_orders: BTreeSet::new(),
+        }
+    }
+
+    fn with_open_buy_collateral(
+        collateral_limit: Decimal,
+        open_buy_collateral: OpenBuyCollateral,
+    ) -> Self {
+        Self {
+            remaining_collateral: max_decimal(
+                collateral_limit - open_buy_collateral.collateral(),
+                Decimal::ZERO,
+            ),
+            counted_open_buy_orders: open_buy_collateral.order_ids,
         }
     }
 
@@ -320,7 +332,9 @@ pub(crate) async fn preflight_risk_audit(
     cli: &Cli,
 ) -> Result<PreflightRiskAuditResult> {
     if markets.is_empty() {
-        return Ok(PreflightRiskAuditResult::Continue);
+        return Ok(PreflightRiskAuditResult::Continue(RiskBudget::new(
+            cli.max_total_collateral,
+        )));
     }
 
     println!("preflight risk audit: checking {} markets", markets.len());
@@ -407,7 +421,9 @@ pub(crate) async fn preflight_risk_audit(
         return Ok(PreflightRiskAuditResult::Stop);
     }
 
-    Ok(PreflightRiskAuditResult::Continue)
+    Ok(PreflightRiskAuditResult::Continue(
+        RiskBudget::with_open_buy_collateral(cli.max_total_collateral, global_open_buys),
+    ))
 }
 
 async fn build_market_token_quotes(
@@ -2208,6 +2224,28 @@ mod tests {
         audit.reserve_open_buy_order(&order);
 
         assert_eq!(audit.collateral(), dec!(2));
+    }
+
+    #[test]
+    fn risk_budget_carries_preflight_open_buy_collateral() {
+        let order = open_order(
+            "open-buy",
+            ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            },
+        );
+        let mut audit = OpenBuyCollateral::default();
+        audit.reserve_open_buy_order(&order);
+
+        let mut budget = RiskBudget::with_open_buy_collateral(dec!(10), audit);
+
+        assert_eq!(budget.remaining_collateral(), dec!(8));
+        budget.reserve_open_buy_order(&order);
+        assert_eq!(budget.remaining_collateral(), dec!(8));
+        assert_eq!(budget.reserve_new_collateral(dec!(10)), dec!(8));
     }
 
     #[test]
