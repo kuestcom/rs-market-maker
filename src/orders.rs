@@ -1223,8 +1223,15 @@ async fn open_orders_for_token(
     Ok(orders)
 }
 
-async fn trades_for_token(live: &LiveTrading, token_id: U256) -> Result<Vec<TradeResponse>> {
-    let request = TradesRequest::builder().asset_id(token_id).build();
+async fn trades_for_token(
+    live: &LiveTrading,
+    token_id: U256,
+    after_unix_secs: Option<i64>,
+) -> Result<Vec<TradeResponse>> {
+    let request = TradesRequest::builder()
+        .asset_id(token_id)
+        .maybe_after(after_unix_secs)
+        .build();
     let mut cursor = None;
     let mut trades = Vec::new();
 
@@ -1365,7 +1372,12 @@ impl LiveMarketState {
         let mut fill_ledger_changed = false;
         let mut tokens = Vec::new();
         for token_quote in token_quotes {
-            let fetched_trades = trades_for_token(live, token_quote.token_id).await?;
+            let token_id = token_quote.token_id.to_string();
+            let after_unix_secs = fill_ledger
+                .latest_matched_at_unix_secs(&token_id)
+                .map(|matched_at| matched_at.saturating_sub(1));
+            let fetched_trades =
+                trades_for_token(live, token_quote.token_id, after_unix_secs).await?;
             for trade in fetched_trades {
                 if fill_ledger.upsert(fill_record_from_trade(&trade)) {
                     fill_ledger_changed = true;
@@ -1374,7 +1386,6 @@ impl LiveMarketState {
 
             let balance = conditional_balance(live, token_quote.token_id).await?;
             let balance_fetched_at = Instant::now();
-            let token_id = token_quote.token_id.to_string();
             let fill_records = fill_ledger.records_for_token(&token_id);
             let cost_basis = token_cost_basis(&fill_records, balance, token_quote.fair_price);
             let open_orders = open_orders_for_token(live, token_quote.token_id).await?;
@@ -1387,6 +1398,9 @@ impl LiveMarketState {
                 open_orders,
                 open_orders_fetched_at,
             });
+        }
+        if fill_ledger.prune_to_max_records(cli.fill_max_records) {
+            fill_ledger_changed = true;
         }
         if fill_ledger_changed {
             fill_ledger.save(&cli.fill_state_path)?;
@@ -3241,6 +3255,7 @@ mod tests {
             refresh_secs: 30,
             state_path: PathBuf::from("state/seen-markets.json"),
             fill_state_path: PathBuf::from("state/fills.json"),
+            fill_max_records: 10_000,
         }
     }
 }

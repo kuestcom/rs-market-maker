@@ -296,7 +296,8 @@ normal discovery selection.
   Maximum simulated worst-case market loss allowed after existing balances,
   open orders, and the proposed new order are counted. Necessary because
   collateral caps alone do not account for cross-outcome inventory. Existing
-  balances are marked at current fair value because fill history is not tracked.
+  balances are valued at realized cost basis from the persisted fill ledger
+  where available; only uncovered balances fall back to current fair value.
 
   --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
   Default: 25.
@@ -347,4 +348,9 @@ normal discovery selection.
   Default: state/fills.json.
   Persisted authenticated trade ledger used to compute realized cost basis for
   live outcome-token balances.
+
+  --fill-max-records / MARKET_MAKER_FILL_MAX_RECORDS
+  Default: 10000.
+  Maximum fill records retained in the persisted ledger. The oldest records are
+  pruned after each live state refresh to keep cycle latency bounded.
 ```

@@ -206,6 +206,9 @@ pub struct Cli {
         default_value = "state/fills.json"
     )]
     pub fill_state_path: PathBuf,
+
+    #[arg(long, env = "MARKET_MAKER_FILL_MAX_RECORDS", default_value_t = 10_000)]
+    pub fill_max_records: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -268,6 +271,9 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.fill_state_path.as_os_str().is_empty() {
         bail!("MARKET_MAKER_FILL_STATE_PATH cannot be empty");
+    }
+    if cli.fill_max_records == 0 {
+        bail!("MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero");
     }
     if cli.clear_pause && (cli.cancel_all || cli.cancel_all_on_exit) {
         bail!("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions");

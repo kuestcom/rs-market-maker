@@ -5,7 +5,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use kuest_client_sdk::types::Decimal;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+fn load_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn load_or_default<T: Default + DeserializeOwned>(path: &Path) -> Result<T> {
+    Ok(load_json(path)?.unwrap_or_default())
+}
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -24,12 +39,7 @@ pub struct SeenMarkets {
 
 impl SeenMarkets {
     pub fn load(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .with_context(|| format!("failed to parse {}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-        }
+        load_or_default(path)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -49,13 +59,7 @@ pub struct PauseState {
 
 impl PauseState {
     pub fn load(path: &Path) -> Result<Option<Self>> {
-        match fs::read_to_string(path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .with_context(|| format!("failed to parse {}", path.display()))
-                .map(Some),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-        }
+        load_json(path)
     }
 
     pub fn save_reason(path: &Path, reason: impl Into<String>) -> Result<Self> {
@@ -104,12 +108,7 @@ pub struct FillLedger {
 
 impl FillLedger {
     pub fn load(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .with_context(|| format!("failed to parse {}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-        }
+        load_or_default(path)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -136,5 +135,32 @@ impl FillLedger {
                 .then_with(|| left.id.cmp(&right.id))
         });
         records
+    }
+
+    pub fn latest_matched_at_unix_secs(&self, token_id: &str) -> Option<i64> {
+        self.trades
+            .values()
+            .filter(|record| record.token_id == token_id)
+            .map(|record| record.matched_at_unix_secs)
+            .max()
+    }
+
+    pub fn prune_to_max_records(&mut self, max_records: usize) -> bool {
+        if self.trades.len() <= max_records {
+            return false;
+        }
+
+        let mut records = self
+            .trades
+            .values()
+            .map(|record| (record.matched_at_unix_secs, record.id.clone()))
+            .collect::<Vec<_>>();
+        records.sort();
+
+        for (_, id) in records.into_iter().take(self.trades.len() - max_records) {
+            self.trades.remove(&id);
+        }
+
+        true
     }
 }

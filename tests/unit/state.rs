@@ -61,7 +61,7 @@ fn fill_ledger_round_trips_and_filters_by_token() {
     let _ = fs::remove_file(&path);
 
     let mut ledger = FillLedger::default();
-    assert!(ledger.upsert(FillRecord {
+    let expected = FillRecord {
         id: "trade-a".to_owned(),
         token_id: "1".to_owned(),
         market: "market-a".to_owned(),
@@ -70,7 +70,8 @@ fn fill_ledger_round_trips_and_filters_by_token() {
         price: dec!(0.40),
         status: "Matched".to_owned(),
         matched_at_unix_secs: 2,
-    }));
+    };
+    assert!(ledger.upsert(expected.clone()));
     assert!(ledger.upsert(FillRecord {
         id: "trade-b".to_owned(),
         token_id: "2".to_owned(),
@@ -87,9 +88,36 @@ fn fill_ledger_round_trips_and_filters_by_token() {
     let token_records = loaded.records_for_token("1");
 
     assert_eq!(token_records.len(), 1);
-    assert_eq!(token_records[0].id, "trade-a");
+    assert_eq!(token_records[0], &expected);
+    assert_eq!(loaded.latest_matched_at_unix_secs("1"), Some(2));
+    assert_eq!(loaded.latest_matched_at_unix_secs("missing"), None);
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn fill_ledger_prunes_oldest_records() {
+    let mut ledger = FillLedger::default();
+    for (id, matched_at_unix_secs) in [("trade-a", 1), ("trade-b", 3), ("trade-c", 2)] {
+        assert!(ledger.upsert(FillRecord {
+            id: id.to_owned(),
+            token_id: "1".to_owned(),
+            market: "market-a".to_owned(),
+            side: "BUY".to_owned(),
+            size: dec!(1),
+            price: dec!(0.50),
+            status: "Matched".to_owned(),
+            matched_at_unix_secs,
+        }));
+    }
+
+    assert!(ledger.prune_to_max_records(2));
+
+    assert_eq!(ledger.trades.len(), 2);
+    assert!(!ledger.trades.contains_key("trade-a"));
+    assert!(ledger.trades.contains_key("trade-b"));
+    assert!(ledger.trades.contains_key("trade-c"));
+    assert!(!ledger.prune_to_max_records(2));
 }
 
 fn unique_state_path(name: &str) -> std::path::PathBuf {
