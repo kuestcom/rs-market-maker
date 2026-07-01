@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ pub(crate) struct CancelOpenOrdersSummary {
 
 pub(crate) struct RiskBudget {
     remaining_collateral: Decimal,
-    counted_open_buy_orders: BTreeSet<String>,
+    counted_open_buy_orders: BTreeMap<String, Decimal>,
 }
 
 pub(crate) enum PreflightRiskAuditResult {
@@ -60,7 +60,7 @@ impl RiskBudget {
     pub(crate) fn new(collateral_limit: Decimal) -> Self {
         Self {
             remaining_collateral: max_decimal(collateral_limit, Decimal::ZERO),
-            counted_open_buy_orders: BTreeSet::new(),
+            counted_open_buy_orders: BTreeMap::new(),
         }
     }
 
@@ -73,7 +73,7 @@ impl RiskBudget {
                 collateral_limit - open_buy_collateral.collateral(),
                 Decimal::ZERO,
             ),
-            counted_open_buy_orders: open_buy_collateral.order_ids,
+            counted_open_buy_orders: open_buy_collateral.reserved_orders,
         }
     }
 
@@ -82,21 +82,24 @@ impl RiskBudget {
     }
 
     fn reserve_open_buy_order(&mut self, order: &OpenOrderResponse) {
-        if order.side != Side::Buy || !self.counted_open_buy_orders.insert(order.id.clone()) {
+        if order.side != Side::Buy || self.counted_open_buy_orders.contains_key(&order.id) {
             return;
         }
 
         let locked = open_order_remaining_size(order) * order.price;
+        self.counted_open_buy_orders
+            .insert(order.id.clone(), locked);
         self.remaining_collateral = max_decimal(self.remaining_collateral - locked, Decimal::ZERO);
     }
 
     fn release_open_buy_order(&mut self, order: &OpenOrderResponse) {
-        if order.side != Side::Buy || !self.counted_open_buy_orders.remove(&order.id) {
+        if order.side != Side::Buy {
             return;
         }
 
-        let locked = open_order_remaining_size(order) * order.price;
-        self.remaining_collateral += locked;
+        if let Some(locked) = self.counted_open_buy_orders.remove(&order.id) {
+            self.remaining_collateral += locked;
+        }
     }
 
     fn reserve_new_collateral(&mut self, requested: Decimal) -> Decimal {
@@ -162,7 +165,7 @@ struct LiveTokenState {
 
 #[derive(Debug, Default)]
 struct OpenBuyCollateral {
-    order_ids: BTreeSet<String>,
+    reserved_orders: BTreeMap<String, Decimal>,
     collateral: Decimal,
 }
 
@@ -508,11 +511,13 @@ impl OpenBuyCollateral {
     }
 
     fn reserve_open_buy_order(&mut self, order: &OpenOrderResponse) {
-        if order.side != Side::Buy || !self.order_ids.insert(order.id.clone()) {
+        if order.side != Side::Buy || self.reserved_orders.contains_key(&order.id) {
             return;
         }
 
-        self.collateral += open_order_remaining_size(order) * order.price;
+        let locked = open_order_remaining_size(order) * order.price;
+        self.reserved_orders.insert(order.id.clone(), locked);
+        self.collateral += locked;
     }
 
     fn collateral(&self) -> Decimal {
@@ -2266,7 +2271,7 @@ mod tests {
 
     #[test]
     fn risk_budget_releases_preflight_open_buy_collateral() {
-        let order = open_order(
+        let mut order = open_order(
             "open-buy",
             ProposedOrder {
                 token_id: U256::from(1),
@@ -2279,6 +2284,7 @@ mod tests {
         audit.reserve_open_buy_order(&order);
         let mut budget = RiskBudget::with_open_buy_collateral(dec!(10), audit);
 
+        order.size_matched = dec!(2);
         budget.release_open_buy_order(&order);
 
         assert_eq!(budget.remaining_collateral(), dec!(10));
