@@ -164,6 +164,21 @@ fn cancel_all_on_exit_requires_live_mode() {
 }
 
 #[test]
+fn cancel_on_risk_breach_requires_live_mode() {
+    let mut cli = valid_cli();
+    cli.cancel_on_risk_breach = true;
+
+    let error =
+        validate_cli(&cli).expect_err("cancel on risk breach without live mode should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_CANCEL_ON_RISK_BREACH")
+    );
+}
+
+#[test]
 fn cancel_all_modes_are_mutually_exclusive() {
     let mut cli = valid_live_cli();
     cli.cancel_all = true;
@@ -202,6 +217,7 @@ fn valid_cli() -> Cli {
         cancel_before_quote: true,
         cancel_all: false,
         cancel_all_on_exit: false,
+        cancel_on_risk_breach: false,
         post_only: true,
         require_two_sided_live: true,
         min_price: dec!(0.05),

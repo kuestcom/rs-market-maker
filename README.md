@@ -70,6 +70,8 @@ accepted orders as pending local exposure. It also skips live posts when order
 books, balances, or open orders are older than the configured data-age limit.
 Buy-side sizing is inventory-aware: balances, live open orders, and pending
 orders are counted before adding more long exposure to an outcome or market.
+When current state already breaches inventory, market-loss, or collateral caps,
+the bot skips new quotes and can optionally cancel resting buy orders.
 
 To cancel scoped live orders without quoting, run:
 
@@ -230,6 +232,12 @@ normal discovery selection.
   Live-only shutdown guard. On Ctrl-C or SIGTERM, cancels open orders for the
   markets currently managed by this process and verifies whether any remain.
   Necessary when you do not want interrupted runs to leave stale GTC orders.
+
+  --cancel-on-risk-breach / MARKET_MAKER_CANCEL_ON_RISK_BREACH
+  Default: false.
+  Live-only circuit-breaker action. When current state already breaches
+  inventory, market-loss, or market-collateral caps, skip new quotes and cancel
+  resting buy orders for the breached token.
 
   --post-only / MARKET_MAKER_POST_ONLY
   Default: true.
