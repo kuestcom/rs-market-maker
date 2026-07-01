@@ -104,6 +104,23 @@ pub struct Cli {
     )]
     pub cancel_on_risk_breach: bool,
 
+    #[arg(
+        long,
+        env = "MARKET_MAKER_PAUSE_ON_RISK_BREACH",
+        default_value_t = false
+    )]
+    pub pause_on_risk_breach: bool,
+
+    #[arg(long, env = "MARKET_MAKER_CLEAR_PAUSE", default_value_t = false)]
+    pub clear_pause: bool,
+
+    #[arg(
+        long,
+        env = "MARKET_MAKER_PAUSE_PATH",
+        default_value = "state/paused.json"
+    )]
+    pub pause_path: PathBuf,
+
     #[arg(long, env = "MARKET_MAKER_POST_ONLY", default_value_t = true)]
     pub post_only: bool,
 
@@ -232,6 +249,15 @@ impl Cli {
 }
 
 pub fn validate_cli(cli: &Cli) -> Result<()> {
+    if cli.pause_path.as_os_str().is_empty() {
+        bail!("MARKET_MAKER_PAUSE_PATH cannot be empty");
+    }
+    if cli.clear_pause && (cli.cancel_all || cli.cancel_all_on_exit) {
+        bail!("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions");
+    }
+    if cli.clear_pause {
+        return Ok(());
+    }
     if cli.max_markets == 0 {
         bail!("MARKET_MAKER_MAX_MARKETS must be greater than zero");
     }
@@ -291,6 +317,9 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.cancel_on_risk_breach && !cli.live {
         bail!("MARKET_MAKER_CANCEL_ON_RISK_BREACH requires --live");
     }
+    if cli.pause_on_risk_breach && !cli.live {
+        bail!("MARKET_MAKER_PAUSE_ON_RISK_BREACH requires --live");
+    }
     if cli.min_price <= Decimal::ZERO || cli.min_price >= Decimal::ONE {
         bail!("MARKET_MAKER_MIN_PRICE must be between 0 and 1");
     }
@@ -324,7 +353,7 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.max_open_orders_per_token == 0 {
         bail!("MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN must be greater than zero");
     }
-    if cli.live {
+    if cli.live && !cli.clear_pause {
         if cli.private_key.as_deref().is_none_or(str::is_empty) {
             bail!("--live requires KUEST_PRIVATE_KEY or --private-key");
         }
