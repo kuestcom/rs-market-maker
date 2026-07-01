@@ -59,10 +59,13 @@ If a sell order returns `position balance 0 below required 5000000`, the wallet
 has zero balance for that outcome token and the order size is 5 shares
 (`5 * 10^6` base units).
 
-Live mode also checks open orders and balances before posting. It subtracts
-collateral already locked by live buy orders, checks sell orders against
-available outcome-token balance, respects configured collateral caps, and
-blocks quotes whose simulated fill would exceed the configured market loss cap.
+Live mode runs a preflight risk audit on the selected market scope before
+quoting. It fetches current books, balances, and open orders; skips the cycle
+if those inputs cannot be fetched or are stale; and stops before quoting if
+current exposure already breaches configured risk caps. It subtracts collateral
+already locked by live buy orders, checks sell orders against available
+outcome-token balance, respects configured collateral caps, and blocks quotes
+whose simulated fill would exceed the configured market loss cap.
 By default, it also requires a two-sided book with acceptable spread and
 top-of-book depth before quoting. After cancel requests, live mode refreshes
 open orders before posting replacements; after post responses, it only counts

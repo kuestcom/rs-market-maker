@@ -13,7 +13,8 @@ use crate::discovery::{
     select_event_candidates,
 };
 use crate::orders::{
-    CancelOpenOrdersSummary, RiskBudget, authenticate, cancel_open_orders_for_markets, quote_market,
+    CancelOpenOrdersSummary, PreflightRiskAuditResult, RiskBudget, authenticate,
+    cancel_open_orders_for_markets, preflight_risk_audit, quote_market,
 };
 use crate::state::{PauseState, SeenMarkets};
 
@@ -109,7 +110,25 @@ async fn run_cycles(
             continue;
         }
 
-        let mut risk_budget = RiskBudget::new(cli.max_total_collateral);
+        let mut risk_budget = if let Some(live) = live {
+            let markets = candidates
+                .iter()
+                .map(|candidate| candidate.market.clone())
+                .collect::<Vec<_>>();
+            match preflight_risk_audit(public_client, live, &markets, cli).await? {
+                PreflightRiskAuditResult::Continue(risk_budget) => risk_budget,
+                PreflightRiskAuditResult::SkipCycle => {
+                    if cycle < cli.cycles {
+                        sleep(Duration::from_secs(cli.refresh_secs)).await;
+                    }
+                    continue;
+                }
+                PreflightRiskAuditResult::Stop => return Ok(()),
+            }
+        } else {
+            RiskBudget::new(cli.max_total_collateral)
+        };
+
         for candidate in candidates {
             quote_market(
                 public_client,
