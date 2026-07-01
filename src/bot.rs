@@ -7,7 +7,7 @@ use kuest_client_sdk::clob::{Client, Config};
 use tokio::time::sleep;
 
 use crate::PublicClient;
-use crate::config::Cli;
+use crate::config::{Cli, validate_cli};
 use crate::discovery::{
     MarketCandidate, discover_event_markets, discover_markets, market_key, select_candidates,
     select_event_candidates,
@@ -20,6 +20,8 @@ use crate::state::{PauseState, SeenMarkets};
 type ManagedScope = Arc<Mutex<Vec<MarketResponse>>>;
 
 pub async fn run(cli: Cli) -> Result<()> {
+    validate_cli(&cli)?;
+
     if cli.clear_pause {
         let cleared = PauseState::clear(&cli.pause_path)?;
         if cleared {
@@ -289,6 +291,9 @@ async fn shutdown_signal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    use clap::Parser as _;
 
     #[test]
     fn managed_scope_snapshot_preserves_empty_scope() {
@@ -297,5 +302,34 @@ mod tests {
         let markets = managed_scope_markets(&managed_scope).expect("managed scope should lock");
 
         assert!(markets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_rejects_clear_pause_cancel_all_before_clearing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "rs-market-maker-bot-clear-pause-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::write(&path, r#"{"reason":"test","created_at_unix_secs":1}"#)
+            .expect("pause file should be created");
+
+        let pause_path = path.to_string_lossy().to_string();
+        let cli = Cli::parse_from([
+            "rs-market-maker",
+            "--clear-pause",
+            "--cancel-all",
+            "--pause-path",
+            pause_path.as_str(),
+        ]);
+
+        let error = run(cli)
+            .await
+            .expect_err("clear pause plus cancel all should fail");
+
+        assert!(error.to_string().contains("MARKET_MAKER_CLEAR_PAUSE"));
+        assert!(path.exists(), "pause file should not be cleared");
+
+        let _ = fs::remove_file(path);
     }
 }
