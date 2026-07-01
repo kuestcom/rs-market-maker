@@ -6,14 +6,14 @@ use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use anyhow::{Context as _, Result};
 use kuest_client_sdk::auth::Signer as _;
 use kuest_client_sdk::clob::types::request::{
-    BalanceAllowanceRequest, OrderBookSummaryRequest, OrdersRequest,
+    BalanceAllowanceRequest, OrderBookSummaryRequest, OrdersRequest, TradesRequest,
 };
 use kuest_client_sdk::clob::types::response::{
     MarketResponse, OpenOrderResponse, OrderBookSummaryResponse, OrderSummary, PostOrderResponse,
-    Token,
+    Token, TradeResponse,
 };
 use kuest_client_sdk::clob::types::{
-    AssetType, OrderStatusType, OrderType, Side, SignatureType, SignedOrder,
+    AssetType, OrderStatusType, OrderType, Side, SignatureType, SignedOrder, TradeStatusType,
 };
 use kuest_client_sdk::clob::{Client, Config};
 use kuest_client_sdk::types::{Address, Decimal, U256};
@@ -22,7 +22,7 @@ use tokio::time::sleep;
 use crate::config::Cli;
 use crate::discovery::market_key;
 use crate::pricing::{best_ask, best_bid, fair_price, max_decimal, min_decimal};
-use crate::state::PauseState;
+use crate::state::{FillLedger, FillRecord, PauseState};
 use crate::{AuthClient, PublicClient};
 
 const TERMINAL_CURSOR: &str = "LTE=";
@@ -166,8 +166,8 @@ struct LiveMarketState {
 #[derive(Clone, Debug)]
 struct LiveTokenState {
     token_id: U256,
-    fair_price: Decimal,
     balance: Decimal,
+    cost_basis: Decimal,
     balance_fetched_at: Instant,
     open_orders: Vec<OpenOrderResponse>,
     open_orders_fetched_at: Instant,
@@ -334,7 +334,7 @@ pub(crate) async fn quote_market(
         let mut market_state = if let Some(market_state) = preflight_market_state {
             market_state
         } else {
-            LiveMarketState::load(live, &token_quotes).await?
+            LiveMarketState::load(live, &token_quotes, cli).await?
         };
         if let Some(reason) =
             preflight_stale_data_reason(&token_quotes, &market_state, Instant::now(), cli)?
@@ -408,7 +408,7 @@ pub(crate) async fn preflight_risk_audit(
                 return Ok(PreflightRiskAuditResult::SkipCycle);
             }
         };
-        let market_state = match LiveMarketState::load(live, &token_quotes).await {
+        let market_state = match LiveMarketState::load(live, &token_quotes, cli).await {
             Ok(market_state) => market_state,
             Err(error) => {
                 println!(
@@ -1223,6 +1223,64 @@ async fn open_orders_for_token(
     Ok(orders)
 }
 
+async fn trades_for_token(
+    live: &LiveTrading,
+    token_id: U256,
+    after_unix_secs: Option<i64>,
+) -> Result<Vec<TradeResponse>> {
+    let request = TradesRequest::builder()
+        .asset_id(token_id)
+        .maybe_after(after_unix_secs)
+        .build();
+    let mut cursor = None;
+    let mut trades = Vec::new();
+
+    loop {
+        let page = live
+            .client
+            .trades(&request, cursor.clone())
+            .await
+            .with_context(|| format!("failed to fetch trades for token {token_id}"))?;
+        let next_cursor = page.next_cursor.clone();
+        trades.extend(page.data.into_iter().filter(is_filled_trade));
+        if next_cursor == TERMINAL_CURSOR || cursor.as_deref() == Some(next_cursor.as_str()) {
+            break;
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Ok(trades)
+}
+
+fn is_filled_trade(trade: &TradeResponse) -> bool {
+    matches!(
+        trade.status,
+        TradeStatusType::Matched | TradeStatusType::Mined | TradeStatusType::Confirmed
+    )
+}
+
+fn fill_record_from_trade(trade: &TradeResponse) -> FillRecord {
+    FillRecord {
+        id: trade.id.clone(),
+        token_id: trade.asset_id.to_string(),
+        market: trade.market.to_string(),
+        side: side_label(trade.side).to_owned(),
+        size: trade.size,
+        price: trade.price,
+        status: trade.status.to_string(),
+        matched_at_unix_secs: trade.match_time.timestamp(),
+    }
+}
+
+fn side_label(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "BUY",
+        Side::Sell => "SELL",
+        Side::Unknown => "UNKNOWN",
+        _ => "UNKNOWN",
+    }
+}
+
 pub(crate) async fn cancel_open_orders_for_markets(
     live: &LiveTrading,
     markets: &[MarketResponse],
@@ -1309,21 +1367,43 @@ async fn remaining_open_orders_for_tokens(live: &LiveTrading, token_ids: &[U256]
 }
 
 impl LiveMarketState {
-    async fn load(live: &LiveTrading, token_quotes: &[TokenQuote]) -> Result<Self> {
+    async fn load(live: &LiveTrading, token_quotes: &[TokenQuote], cli: &Cli) -> Result<Self> {
+        let mut fill_ledger = FillLedger::load(&cli.fill_state_path)?;
+        let mut fill_ledger_changed = false;
         let mut tokens = Vec::new();
         for token_quote in token_quotes {
+            let token_id = token_quote.token_id.to_string();
+            let after_unix_secs = fill_ledger
+                .latest_matched_at_unix_secs(&token_id)
+                .map(|matched_at| matched_at.saturating_sub(1));
+            let fetched_trades =
+                trades_for_token(live, token_quote.token_id, after_unix_secs).await?;
+            for trade in fetched_trades {
+                if fill_ledger.upsert(fill_record_from_trade(&trade)) {
+                    fill_ledger_changed = true;
+                }
+            }
+
             let balance = conditional_balance(live, token_quote.token_id).await?;
             let balance_fetched_at = Instant::now();
+            let fill_records = fill_ledger.records_for_token(&token_id);
+            let cost_basis = token_cost_basis(&fill_records, balance, token_quote.fair_price);
             let open_orders = open_orders_for_token(live, token_quote.token_id).await?;
             let open_orders_fetched_at = Instant::now();
             tokens.push(LiveTokenState {
                 token_id: token_quote.token_id,
-                fair_price: token_quote.fair_price,
                 balance,
+                cost_basis,
                 balance_fetched_at,
                 open_orders,
                 open_orders_fetched_at,
             });
+        }
+        if fill_ledger.prune_to_max_records(cli.fill_max_records) {
+            fill_ledger_changed = true;
+        }
+        if fill_ledger_changed {
+            fill_ledger.save(&cli.fill_state_path)?;
         }
 
         Ok(Self {
@@ -1446,7 +1526,7 @@ impl LiveMarketState {
                 .map(|token| OutcomeExposure {
                     token_id: token.token_id,
                     position: token.balance,
-                    cost: token.balance * token.fair_price,
+                    cost: token.cost_basis,
                     proceeds: Decimal::ZERO,
                 })
                 .collect(),
@@ -1588,6 +1668,48 @@ fn apply_order_to_outcome(outcome: &mut OutcomeExposure, order: ProposedOrder) {
         }
         Side::Unknown => {}
         _ => {}
+    }
+}
+
+fn token_cost_basis(
+    fill_records: &[&FillRecord],
+    live_balance: Decimal,
+    fallback_fair_price: Decimal,
+) -> Decimal {
+    if live_balance <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    let mut position = Decimal::ZERO;
+    let mut cost = Decimal::ZERO;
+    for record in fill_records {
+        match record.side.as_str() {
+            "BUY" => {
+                position += record.size;
+                cost += record.size * record.price;
+            }
+            "SELL" => {
+                if position <= Decimal::ZERO {
+                    continue;
+                }
+                let sell_size = min_decimal(record.size, position);
+                let avg_cost = cost / position;
+                cost = max_decimal(cost - avg_cost * sell_size, Decimal::ZERO);
+                position = max_decimal(position - sell_size, Decimal::ZERO);
+            }
+            _ => {}
+        }
+    }
+
+    if position <= Decimal::ZERO {
+        return live_balance * fallback_fair_price;
+    }
+
+    let avg_cost = cost / position;
+    if live_balance <= position {
+        live_balance * avg_cost
+    } else {
+        cost + (live_balance - position) * fallback_fair_price
     }
 }
 
@@ -2551,6 +2673,40 @@ mod tests {
     }
 
     #[test]
+    fn token_cost_basis_uses_realized_average_cost_after_sells() {
+        let records = [
+            fill_record("buy-a", "1", "BUY", dec!(10), dec!(0.40), 1),
+            fill_record("sell-a", "1", "SELL", dec!(4), dec!(0.70), 2),
+        ];
+        let refs = records.iter().collect::<Vec<_>>();
+
+        let cost_basis = token_cost_basis(&refs, dec!(6), dec!(0.50));
+
+        assert_eq!(cost_basis, dec!(2.4));
+    }
+
+    #[test]
+    fn token_cost_basis_falls_back_for_uncovered_balance() {
+        let records = [fill_record("buy-a", "1", "BUY", dec!(2), dec!(0.40), 1)];
+        let refs = records.iter().collect::<Vec<_>>();
+
+        let cost_basis = token_cost_basis(&refs, dec!(5), dec!(0.50));
+
+        assert_eq!(cost_basis, dec!(2.3));
+    }
+
+    #[test]
+    fn exposure_uses_token_cost_basis_for_existing_balances() {
+        let mut market_state = test_market_state();
+        market_state.tokens[0].balance = dec!(5);
+        market_state.tokens[0].cost_basis = dec!(2);
+
+        let exposure = market_state.exposure();
+
+        assert_eq!(exposure.buy_collateral(), dec!(2));
+    }
+
+    #[test]
     fn liquidity_guard_follows_two_sided_live_flag() {
         let mut cli = test_cli();
         cli.live = true;
@@ -3005,21 +3161,41 @@ mod tests {
             .build()
     }
 
+    fn fill_record(
+        id: &str,
+        token_id: &str,
+        side: &str,
+        size: Decimal,
+        price: Decimal,
+        matched_at_unix_secs: i64,
+    ) -> FillRecord {
+        FillRecord {
+            id: id.to_owned(),
+            token_id: token_id.to_owned(),
+            market: "market-a".to_owned(),
+            side: side.to_owned(),
+            size,
+            price,
+            status: "Matched".to_owned(),
+            matched_at_unix_secs,
+        }
+    }
+
     fn test_market_state() -> LiveMarketState {
         LiveMarketState {
             tokens: vec![
                 LiveTokenState {
                     token_id: U256::from(1),
-                    fair_price: dec!(0.50),
                     balance: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
                     balance_fetched_at: Instant::now(),
                     open_orders: Vec::new(),
                     open_orders_fetched_at: Instant::now(),
                 },
                 LiveTokenState {
                     token_id: U256::from(2),
-                    fair_price: dec!(0.50),
                     balance: Decimal::ZERO,
+                    cost_basis: Decimal::ZERO,
                     balance_fetched_at: Instant::now(),
                     open_orders: Vec::new(),
                     open_orders_fetched_at: Instant::now(),
@@ -3078,6 +3254,8 @@ mod tests {
             cycles: 1,
             refresh_secs: 30,
             state_path: PathBuf::from("state/seen-markets.json"),
+            fill_state_path: PathBuf::from("state/fills.json"),
+            fill_max_records: 10_000,
         }
     }
 }

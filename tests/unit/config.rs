@@ -130,6 +130,16 @@ fn zero_max_data_age_is_rejected() {
 }
 
 #[test]
+fn zero_fill_max_records_is_rejected() {
+    let mut cli = valid_cli();
+    cli.fill_max_records = 0;
+
+    let error = validate_cli(&cli).expect_err("zero fill record cap should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_FILL_MAX_RECORDS"));
+}
+
+#[test]
 fn invalid_band_margins_are_rejected() {
     let mut cli = valid_cli();
     cli.band_min_margin_ticks = Some(4);
@@ -295,6 +305,8 @@ fn valid_cli() -> Cli {
         cycles: 1,
         refresh_secs: 30,
         state_path: PathBuf::from("state/seen-markets.json"),
+        fill_state_path: PathBuf::from("state/fills.json"),
+        fill_max_records: 10_000,
     }
 }
 

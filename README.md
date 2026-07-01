@@ -66,6 +66,9 @@ current exposure already breaches configured risk caps. It subtracts collateral
 already locked by live buy orders, checks sell orders against available
 outcome-token balance, respects configured collateral caps, and blocks quotes
 whose simulated fill would exceed the configured market loss cap.
+Authenticated trade history is persisted in `state/fills.json` and used to
+value existing outcome-token balances at realized cost basis where possible;
+only uncovered balances fall back to current fair value.
 By default, it also requires a two-sided book with acceptable spread and
 top-of-book depth before quoting. After cancel requests, live mode refreshes
 open orders before posting replacements; after post responses, it only counts
@@ -293,7 +296,8 @@ normal discovery selection.
   Maximum simulated worst-case market loss allowed after existing balances,
   open orders, and the proposed new order are counted. Necessary because
   collateral caps alone do not account for cross-outcome inventory. Existing
-  balances are marked at current fair value because fill history is not tracked.
+  balances are valued at realized cost basis from the persisted fill ledger
+  where available; only uncovered balances fall back to current fair value.
 
   --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
   Default: 25.
@@ -339,4 +343,14 @@ normal discovery selection.
   Default: 30.
   Sleep between cycles. Necessary when --cycles > 1, so the bot does not
   hammer APIs or churn orders too fast.
+
+  --fill-state-path / MARKET_MAKER_FILL_STATE_PATH
+  Default: state/fills.json.
+  Persisted authenticated trade ledger used to compute realized cost basis for
+  live outcome-token balances.
+
+  --fill-max-records / MARKET_MAKER_FILL_MAX_RECORDS
+  Default: 10000.
+  Maximum fill records retained in the persisted ledger. The oldest records are
+  pruned after each live state refresh to keep cycle latency bounded.
 ```
