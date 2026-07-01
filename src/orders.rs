@@ -945,6 +945,14 @@ impl LiveMarketState {
         Ok(())
     }
 
+    fn remove_pending_orders_now_open(&mut self, open_orders: &[OpenOrderResponse]) {
+        self.pending_orders.retain(|pending_order| {
+            !open_orders
+                .iter()
+                .any(|open_order| open_order_matches_proposed(open_order, *pending_order))
+        });
+    }
+
     fn projected_loss_with_staged(
         &self,
         order: ProposedOrder,
@@ -1337,6 +1345,7 @@ async fn apply_post_responses(
 
     if has_failed_response {
         let refreshed_orders = open_orders_for_token(live, plan.token_id).await?;
+        market_state.remove_pending_orders_now_open(&refreshed_orders);
         market_state.replace_open_orders(plan.token_id, refreshed_orders)?;
         println!(
             "post state refreshed for {} {} after rejected order response",
@@ -1363,6 +1372,13 @@ fn apply_post_response(
     }
     market_state.record_pending_order(submitted_order.proposed_order);
     false
+}
+
+fn open_order_matches_proposed(order: &OpenOrderResponse, proposed_order: ProposedOrder) -> bool {
+    order.asset_id == proposed_order.token_id
+        && order.side == proposed_order.side
+        && order.price == proposed_order.price
+        && open_order_remaining_size(order) == proposed_order.size
 }
 
 fn print_post_responses(plan: &QuotePlan, responses: &[(SubmittedOrder, PostOrderResponse)]) {
@@ -1690,8 +1706,56 @@ mod tests {
         assert!(market_state.pending_orders.is_empty());
     }
 
+    #[test]
+    fn pending_order_is_removed_when_refreshed_open_order_matches_it() {
+        let mut market_state = test_market_state();
+        let proposed_order = ProposedOrder {
+            token_id: U256::from(1),
+            side: Side::Buy,
+            price: dec!(0.40),
+            size: dec!(5),
+        };
+        market_state.record_pending_order(proposed_order);
+        let refreshed_orders = vec![open_order("posted-order", proposed_order)];
+
+        market_state.remove_pending_orders_now_open(&refreshed_orders);
+        market_state
+            .replace_open_orders(U256::from(1), refreshed_orders)
+            .expect("test token should exist");
+
+        assert!(market_state.pending_orders.is_empty());
+        assert_eq!(
+            market_state
+                .open_orders(U256::from(1))
+                .expect("test token should exist")
+                .len(),
+            1
+        );
+        assert_eq!(market_state.exposure().worst_loss(), dec!(2));
+    }
+
     fn level(price: Decimal, size: Decimal) -> OrderSummary {
         OrderSummary::builder().price(price).size(size).build()
+    }
+
+    fn open_order(id: &str, proposed_order: ProposedOrder) -> OpenOrderResponse {
+        OpenOrderResponse::builder()
+            .id(id)
+            .status(OrderStatusType::Live)
+            .owner("01HAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .maker_address(Address::ZERO)
+            .market(Default::default())
+            .asset_id(proposed_order.token_id)
+            .side(proposed_order.side)
+            .original_size(proposed_order.size)
+            .size_matched(Decimal::ZERO)
+            .price(proposed_order.price)
+            .associate_trades(Vec::new())
+            .outcome("YES")
+            .created_at("2024-01-15T12:34:56Z".parse().unwrap())
+            .expiration("2024-01-20T00:00:00Z".parse().unwrap())
+            .order_type(OrderType::GTC)
+            .build()
     }
 
     fn post_response(success: bool) -> PostOrderResponse {
