@@ -443,14 +443,6 @@ pub(crate) async fn preflight_risk_audit(
             );
             return Ok(PreflightRiskAuditResult::SkipCycle);
         }
-        if let Some(reason) = market_state.position_reconcile_reject_reason() {
-            println!(
-                "preflight risk audit skip {}: position reconciliation failed ({reason})",
-                market.market_slug
-            );
-            return Ok(PreflightRiskAuditResult::SkipCycle);
-        }
-
         global_open_buys.reserve_market_state(&market_state);
         let breaches = market_state.risk_breaches(cli);
         if !breaches.is_empty() {
@@ -464,6 +456,13 @@ pub(crate) async fn preflight_risk_audit(
                 println!("wrote pause file {}: {reason}", cli.pause_path.display());
             }
             return Ok(PreflightRiskAuditResult::Stop);
+        }
+        if let Some(reason) = market_state.position_reconcile_reject_reason() {
+            println!(
+                "preflight risk audit skip {}: position reconciliation failed ({reason})",
+                market.market_slug
+            );
+            return Ok(PreflightRiskAuditResult::SkipCycle);
         }
 
         scanned_markets.push((market.clone(), market_state.clone()));
@@ -888,13 +887,6 @@ async fn reconcile_quote_plan(
     market_budget: &mut RiskBudget,
     market_state: &mut LiveMarketState,
 ) -> Result<()> {
-    if let Some(reason) = market_state.position_reconcile_reject_reason() {
-        println!(
-            "skip placing {} {}: position reconciliation failed ({reason})",
-            plan.market_slug, plan.outcome
-        );
-        return Ok(());
-    }
     let mut open_orders = market_state.open_orders(plan.token_id)?.to_vec();
     let orders_to_cancel = cancellable_orders(&open_orders, plan, cli);
     if cli.cancel_before_quote && !orders_to_cancel.is_empty() {
@@ -989,6 +981,13 @@ async fn reconcile_quote_plan(
             PauseState::save_reason(&cli.pause_path, reason.clone())?;
             println!("wrote pause file {}: {reason}", cli.pause_path.display());
         }
+        return Ok(());
+    }
+    if let Some(reason) = market_state.position_reconcile_reject_reason() {
+        println!(
+            "skip placing {} {}: position reconciliation failed ({reason})",
+            plan.market_slug, plan.outcome
+        );
         return Ok(());
     }
 
