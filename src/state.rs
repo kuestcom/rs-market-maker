@@ -6,6 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let raw = serde_json::to_string_pretty(value)?;
+    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct SeenMarkets {
     pub markets: BTreeSet<String>,
@@ -22,13 +32,7 @@ impl SeenMarkets {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let raw = serde_json::to_string_pretty(self)?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+        write_json_pretty(path, self)
     }
 
     pub fn mark_new(&mut self, market_key: String) -> bool {
@@ -76,12 +80,6 @@ impl PauseState {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let raw = serde_json::to_string_pretty(self)?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+        write_json_pretty(path, self)
     }
 }

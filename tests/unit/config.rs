@@ -203,6 +203,25 @@ fn clear_pause_skips_trading_validation() {
 }
 
 #[test]
+fn clear_pause_rejects_cancel_all_actions() {
+    let mut cli = valid_live_cli();
+    cli.clear_pause = true;
+    cli.cancel_all = true;
+
+    let error = validate_cli(&cli).expect_err("clear pause plus cancel all should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_CLEAR_PAUSE"));
+
+    let mut cli = valid_live_cli();
+    cli.clear_pause = true;
+    cli.cancel_all_on_exit = true;
+
+    let error = validate_cli(&cli).expect_err("clear pause plus cancel all on exit should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_CLEAR_PAUSE"));
+}
+
+#[test]
 fn cancel_all_modes_are_mutually_exclusive() {
     let mut cli = valid_live_cli();
     cli.cancel_all = true;

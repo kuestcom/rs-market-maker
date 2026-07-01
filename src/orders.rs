@@ -632,6 +632,9 @@ async fn reconcile_quote_plan(
             .iter()
             .map(|order| order.id.as_str())
             .collect::<Vec<_>>();
+        if skip_live_action_if_paused(plan, cli, "canceling stale orders")? {
+            return Ok(());
+        }
         let response = live
             .client
             .cancel_orders(&order_ids)
@@ -695,7 +698,7 @@ async fn reconcile_quote_plan(
         print_risk_breaches(plan, &breaches);
         if cli.cancel_on_risk_breach
             && let Some(refreshed_orders) =
-                cancel_risk_increasing_orders(live, plan, &remaining_orders).await?
+                cancel_risk_increasing_orders(live, plan, cli, &remaining_orders).await?
         {
             let open_orders_fetched_at = Instant::now();
             market_state.replace_open_orders(
@@ -915,6 +918,9 @@ async fn reconcile_quote_plan(
             collateral: planned_order.collateral,
         });
         signed_orders.push(planned_order.signed_order);
+    }
+    if skip_live_action_if_paused(plan, cli, "posting orders")? {
+        return Ok(());
     }
     let responses = live.client.post_orders(signed_orders).await?;
     let responses = submitted_orders
@@ -1415,6 +1421,7 @@ impl RiskBreach {
 async fn cancel_risk_increasing_orders(
     live: &LiveTrading,
     plan: &QuotePlan,
+    cli: &Cli,
     open_orders: &[&OpenOrderResponse],
 ) -> Result<Option<Vec<OpenOrderResponse>>> {
     let order_ids = open_orders
@@ -1423,6 +1430,10 @@ async fn cancel_risk_increasing_orders(
         .map(|order| order.id.as_str())
         .collect::<Vec<_>>();
     if order_ids.is_empty() {
+        return Ok(None);
+    }
+
+    if skip_live_action_if_paused(plan, cli, "canceling risk-increasing orders")? {
         return Ok(None);
     }
 
@@ -1445,6 +1456,21 @@ async fn cancel_risk_increasing_orders(
     );
 
     Ok(Some(open_orders_for_token(live, plan.token_id).await?))
+}
+
+fn skip_live_action_if_paused(plan: &QuotePlan, cli: &Cli, action: &str) -> Result<bool> {
+    if let Some(pause) = PauseState::load(&cli.pause_path)? {
+        println!(
+            "skip {action} for {} {}: pause active at {} ({})",
+            plan.market_slug,
+            plan.outcome,
+            cli.pause_path.display(),
+            pause.reason.trim()
+        );
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn market_loss_exceeds_cap(
