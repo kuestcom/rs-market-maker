@@ -209,6 +209,13 @@ pub struct Cli {
 
     #[arg(long, env = "MARKET_MAKER_FILL_MAX_RECORDS", default_value_t = 10_000)]
     pub fill_max_records: usize,
+
+    #[arg(
+        long,
+        env = "MARKET_MAKER_POSITION_RECONCILE_TOLERANCE",
+        default_value = "0.000001"
+    )]
+    pub position_reconcile_tolerance: Decimal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -274,6 +281,9 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.fill_max_records == 0 {
         bail!("MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero");
+    }
+    if cli.position_reconcile_tolerance < Decimal::ZERO {
+        bail!("MARKET_MAKER_POSITION_RECONCILE_TOLERANCE cannot be negative");
     }
     if cli.clear_pause && (cli.cancel_all || cli.cancel_all_on_exit) {
         bail!("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions");
