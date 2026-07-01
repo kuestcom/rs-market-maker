@@ -678,18 +678,26 @@ async fn reconcile_quote_plan(
         return Ok(());
     }
 
-    let breaches = market_state.risk_breaches(cli);
-    if !breaches.is_empty() {
-        print_risk_breaches(plan, &breaches);
-        if cli.cancel_on_risk_breach {
-            cancel_risk_increasing_orders(live, plan, &remaining_orders).await?;
-        }
-        return Ok(());
-    }
-
     for order in &remaining_orders {
         global_budget.reserve_open_buy_order(order);
         market_budget.reserve_open_buy_order(order);
+    }
+
+    let breaches = market_state.risk_breaches(cli);
+    if !breaches.is_empty() {
+        print_risk_breaches(plan, &breaches);
+        if cli.cancel_on_risk_breach
+            && let Some(refreshed_orders) =
+                cancel_risk_increasing_orders(live, plan, &remaining_orders).await?
+        {
+            let open_orders_fetched_at = Instant::now();
+            market_state.replace_open_orders(
+                plan.token_id,
+                refreshed_orders,
+                open_orders_fetched_at,
+            )?;
+        }
+        return Ok(());
     }
 
     let collateral_balance = collateral_balance(live).await?;
@@ -1384,14 +1392,14 @@ async fn cancel_risk_increasing_orders(
     live: &LiveTrading,
     plan: &QuotePlan,
     open_orders: &[&OpenOrderResponse],
-) -> Result<()> {
+) -> Result<Option<Vec<OpenOrderResponse>>> {
     let order_ids = open_orders
         .iter()
         .filter(|order| order.side == Side::Buy)
         .map(|order| order.id.as_str())
         .collect::<Vec<_>>();
     if order_ids.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let response = live
@@ -1412,7 +1420,7 @@ async fn cancel_risk_increasing_orders(
         response.not_canceled.len()
     );
 
-    Ok(())
+    Ok(Some(open_orders_for_token(live, plan.token_id).await?))
 }
 
 fn market_loss_exceeds_cap(
@@ -1849,6 +1857,24 @@ mod tests {
         reserve_buy_collateral(dec!(1), &mut global_budget, &mut market_budget);
         assert_eq!(global_budget.remaining_collateral(), dec!(9));
         assert_eq!(market_budget.remaining_collateral(), dec!(9));
+    }
+
+    #[test]
+    fn open_buy_order_reserves_budget_before_risk_breach_return() {
+        let mut budget = RiskBudget::new(dec!(10));
+        let order = open_order(
+            "open-buy",
+            ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            },
+        );
+
+        budget.reserve_open_buy_order(&order);
+
+        assert_eq!(budget.remaining_collateral(), dec!(8));
     }
 
     #[test]
