@@ -96,6 +96,20 @@ fn zero_max_book_spread_is_rejected() {
 }
 
 #[test]
+fn zero_pre_post_move_limit_is_rejected() {
+    let mut cli = valid_cli();
+    cli.max_pre_post_move_ticks = 0;
+
+    let error = validate_cli(&cli).expect_err("zero pre-post move limit should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS")
+    );
+}
+
+#[test]
 fn negative_top_depth_is_rejected() {
     let mut cli = valid_cli();
     cli.min_top_depth = dec!(-1);
@@ -253,6 +267,7 @@ fn valid_cli() -> Cli {
         band_avg_size: None,
         band_max_size: None,
         max_book_spread_ticks: 20,
+        max_pre_post_move_ticks: 2,
         min_top_depth: dec!(5),
         quote_sides: QuoteSides::Buy,
         allow_single_sided: true,

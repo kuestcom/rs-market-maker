@@ -351,6 +351,7 @@ pub(crate) async fn quote_market(
                     return Ok(());
                 }
                 reconcile_quote_plan(
+                    public_client,
                     live,
                     plan,
                     cli,
@@ -856,6 +857,7 @@ fn format_band(band: Option<&QuoteBand>) -> String {
 }
 
 async fn reconcile_quote_plan(
+    public_client: &PublicClient,
     live: &LiveTrading,
     plan: &QuotePlan,
     cli: &Cli,
@@ -1163,6 +1165,16 @@ async fn reconcile_quote_plan(
             collateral: planned_order.collateral,
         });
         signed_orders.push(planned_order.signed_order);
+    }
+    if skip_live_action_if_paused(plan, cli, "posting orders")? {
+        return Ok(());
+    }
+    if let Some(reason) = pre_post_move_reject_reason(public_client, plan, cli).await? {
+        println!(
+            "skip posting {} {}: pre-post price movement ({reason})",
+            plan.market_slug, plan.outcome
+        );
+        return Ok(());
     }
     if skip_live_action_if_paused(plan, cli, "posting orders")? {
         return Ok(());
@@ -2048,6 +2060,56 @@ fn open_order_remaining_size(order: &OpenOrderResponse) -> Decimal {
     max_decimal(order.original_size - order.size_matched, Decimal::ZERO)
 }
 
+async fn pre_post_move_reject_reason(
+    public_client: &PublicClient,
+    plan: &QuotePlan,
+    cli: &Cli,
+) -> Result<Option<String>> {
+    let request = OrderBookSummaryRequest::builder()
+        .token_id(plan.token_id)
+        .build();
+    let book = public_client.order_book(&request).await.with_context(|| {
+        format!(
+            "failed to fetch pre-post order book for token {}",
+            plan.token_id
+        )
+    })?;
+    let refreshed_fair = fair_price(
+        best_bid(&book.bids),
+        best_ask(&book.asks),
+        plan.fair_price,
+        book.last_trade_price,
+    );
+    Ok(price_move_reject_reason(
+        plan.fair_price,
+        refreshed_fair,
+        book.tick_size.as_decimal(),
+        cli.max_pre_post_move_ticks,
+    ))
+}
+
+fn price_move_reject_reason(
+    planned_fair: Decimal,
+    refreshed_fair: Decimal,
+    tick: Decimal,
+    max_move_ticks: u32,
+) -> Option<String> {
+    if tick <= Decimal::ZERO {
+        return Some("refreshed book tick size is invalid".to_owned());
+    }
+
+    let move_ticks = if refreshed_fair > planned_fair {
+        (refreshed_fair - planned_fair) / tick
+    } else {
+        (planned_fair - refreshed_fair) / tick
+    };
+    (move_ticks > Decimal::from(max_move_ticks)).then(|| {
+        format!(
+            "fair moved {move_ticks} ticks from {planned_fair} to {refreshed_fair}; max {max_move_ticks}"
+        )
+    })
+}
+
 fn is_open_order(order: &OpenOrderResponse) -> bool {
     matches!(
         order.status,
@@ -2306,6 +2368,21 @@ mod tests {
         audit.reserve_open_buy_order(&order);
 
         assert_eq!(audit.collateral(), dec!(2));
+    }
+
+    #[test]
+    fn price_move_guard_rejects_large_fair_move() {
+        let reason = price_move_reject_reason(dec!(0.50), dec!(0.53), dec!(0.01), 2)
+            .expect("three tick move should be rejected");
+
+        assert!(reason.contains("fair moved 3 ticks"));
+    }
+
+    #[test]
+    fn price_move_guard_allows_move_at_limit() {
+        let reason = price_move_reject_reason(dec!(0.50), dec!(0.52), dec!(0.01), 2);
+
+        assert!(reason.is_none());
     }
 
     #[test]
@@ -2916,6 +2993,7 @@ mod tests {
             band_avg_size: None,
             band_max_size: None,
             max_book_spread_ticks: 20,
+            max_pre_post_move_ticks: 2,
             min_top_depth: dec!(5),
             quote_sides: QuoteSides::Buy,
             allow_single_sided: true,
