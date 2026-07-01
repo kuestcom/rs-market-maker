@@ -168,9 +168,18 @@ struct LiveTokenState {
     token_id: U256,
     balance: Decimal,
     cost_basis: Decimal,
+    position_reconcile_error: Option<PositionReconcileError>,
     balance_fetched_at: Instant,
     open_orders: Vec<OpenOrderResponse>,
     open_orders_fetched_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PositionReconcileError {
+    live_balance: Decimal,
+    ledger_position: Decimal,
+    difference: Decimal,
+    tolerance: Decimal,
 }
 
 #[derive(Debug, Default)]
@@ -345,6 +354,13 @@ pub(crate) async fn quote_market(
             );
             return Ok(());
         }
+        if let Some(reason) = market_state.position_reconcile_reject_reason() {
+            println!(
+                "skip live quote {}: position reconciliation failed ({reason})",
+                market.market_slug
+            );
+            return Ok(());
+        }
         for token_quote in &token_quotes {
             if let Some(plan) = &token_quote.plan {
                 if PauseState::load(&cli.pause_path)?.is_some() {
@@ -427,7 +443,6 @@ pub(crate) async fn preflight_risk_audit(
             );
             return Ok(PreflightRiskAuditResult::SkipCycle);
         }
-
         global_open_buys.reserve_market_state(&market_state);
         let breaches = market_state.risk_breaches(cli);
         if !breaches.is_empty() {
@@ -441,6 +456,13 @@ pub(crate) async fn preflight_risk_audit(
                 println!("wrote pause file {}: {reason}", cli.pause_path.display());
             }
             return Ok(PreflightRiskAuditResult::Stop);
+        }
+        if let Some(reason) = market_state.position_reconcile_reject_reason() {
+            println!(
+                "preflight risk audit skip {}: position reconciliation failed ({reason})",
+                market.market_slug
+            );
+            return Ok(PreflightRiskAuditResult::SkipCycle);
         }
 
         scanned_markets.push((market.clone(), market_state.clone()));
@@ -961,6 +983,13 @@ async fn reconcile_quote_plan(
         }
         return Ok(());
     }
+    if let Some(reason) = market_state.position_reconcile_reject_reason() {
+        println!(
+            "skip placing {} {}: position reconciliation failed ({reason})",
+            plan.market_slug, plan.outcome
+        );
+        return Ok(());
+    }
 
     let collateral_balance = collateral_balance(live).await?;
     let collateral_fetched_at = Instant::now();
@@ -1388,12 +1417,19 @@ impl LiveMarketState {
             let balance_fetched_at = Instant::now();
             let fill_records = fill_ledger.records_for_token(&token_id);
             let cost_basis = token_cost_basis(&fill_records, balance, token_quote.fair_price);
+            let ledger_position = token_ledger_position(&fill_records);
+            let position_reconcile_error = position_reconcile_error(
+                balance,
+                ledger_position,
+                cli.position_reconcile_tolerance,
+            );
             let open_orders = open_orders_for_token(live, token_quote.token_id).await?;
             let open_orders_fetched_at = Instant::now();
             tokens.push(LiveTokenState {
                 token_id: token_quote.token_id,
                 balance,
                 cost_basis,
+                position_reconcile_error,
                 balance_fetched_at,
                 open_orders,
                 open_orders_fetched_at,
@@ -1512,6 +1548,24 @@ impl LiveMarketState {
         }
 
         breaches
+    }
+
+    fn position_reconcile_reject_reason(&self) -> Option<String> {
+        self.tokens.iter().find_map(|token_state| {
+            token_state
+                .position_reconcile_error
+                .as_ref()
+                .map(|error| {
+                    format!(
+                        "token {} live balance {} differs from fill-ledger position {} by {} (tolerance {})",
+                        token_state.token_id,
+                        error.live_balance,
+                        error.ledger_position,
+                        error.difference,
+                        error.tolerance
+                    )
+                })
+        })
     }
 
     fn record_pending_order(&mut self, order: ProposedOrder) {
@@ -1669,6 +1723,37 @@ fn apply_order_to_outcome(outcome: &mut OutcomeExposure, order: ProposedOrder) {
         Side::Unknown => {}
         _ => {}
     }
+}
+
+fn token_ledger_position(fill_records: &[&FillRecord]) -> Decimal {
+    let mut position = Decimal::ZERO;
+    for record in fill_records {
+        match record.side.as_str() {
+            "BUY" => position += record.size,
+            "SELL" => position -= record.size,
+            _ => {}
+        }
+    }
+
+    position
+}
+
+fn position_reconcile_error(
+    live_balance: Decimal,
+    ledger_position: Decimal,
+    tolerance: Decimal,
+) -> Option<PositionReconcileError> {
+    let difference = decimal_abs(live_balance - ledger_position);
+    (difference > tolerance).then_some(PositionReconcileError {
+        live_balance,
+        ledger_position,
+        difference,
+        tolerance,
+    })
+}
+
+fn decimal_abs(value: Decimal) -> Decimal {
+    if value < Decimal::ZERO { -value } else { value }
 }
 
 fn token_cost_basis(
@@ -2696,6 +2781,45 @@ mod tests {
     }
 
     #[test]
+    fn token_ledger_position_tracks_buys_and_sells() {
+        let records = [
+            fill_record("buy-a", "1", "BUY", dec!(10), dec!(0.40), 1),
+            fill_record("sell-a", "1", "SELL", dec!(4), dec!(0.70), 2),
+        ];
+        let refs = records.iter().collect::<Vec<_>>();
+
+        assert_eq!(token_ledger_position(&refs), dec!(6));
+    }
+
+    #[test]
+    fn position_reconcile_error_respects_tolerance() {
+        assert!(position_reconcile_error(dec!(6.0000005), dec!(6), dec!(0.000001)).is_none());
+
+        let error = position_reconcile_error(dec!(7), dec!(6), dec!(0.000001))
+            .expect("large mismatch should reject");
+
+        assert_eq!(error.live_balance, dec!(7));
+        assert_eq!(error.ledger_position, dec!(6));
+        assert_eq!(error.difference, dec!(1));
+        assert_eq!(error.tolerance, dec!(0.000001));
+    }
+
+    #[test]
+    fn market_state_reports_unreconciled_position() {
+        let mut market_state = test_market_state();
+        market_state.tokens[0].balance = dec!(7);
+        market_state.tokens[0].position_reconcile_error =
+            position_reconcile_error(dec!(7), dec!(6), dec!(0.000001));
+
+        let reason = market_state
+            .position_reconcile_reject_reason()
+            .expect("mismatch should produce reject reason");
+
+        assert!(reason.contains("token 1"));
+        assert!(reason.contains("live balance 7"));
+    }
+
+    #[test]
     fn exposure_uses_token_cost_basis_for_existing_balances() {
         let mut market_state = test_market_state();
         market_state.tokens[0].balance = dec!(5);
@@ -3188,6 +3312,7 @@ mod tests {
                     token_id: U256::from(1),
                     balance: Decimal::ZERO,
                     cost_basis: Decimal::ZERO,
+                    position_reconcile_error: None,
                     balance_fetched_at: Instant::now(),
                     open_orders: Vec::new(),
                     open_orders_fetched_at: Instant::now(),
@@ -3196,6 +3321,7 @@ mod tests {
                     token_id: U256::from(2),
                     balance: Decimal::ZERO,
                     cost_basis: Decimal::ZERO,
+                    position_reconcile_error: None,
                     balance_fetched_at: Instant::now(),
                     open_orders: Vec::new(),
                     open_orders_fetched_at: Instant::now(),
@@ -3256,6 +3382,7 @@ mod tests {
             state_path: PathBuf::from("state/seen-markets.json"),
             fill_state_path: PathBuf::from("state/fills.json"),
             fill_max_records: 10_000,
+            position_reconcile_tolerance: dec!(0.000001),
         }
     }
 }

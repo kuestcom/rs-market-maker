@@ -67,8 +67,9 @@ already locked by live buy orders, checks sell orders against available
 outcome-token balance, respects configured collateral caps, and blocks quotes
 whose simulated fill would exceed the configured market loss cap.
 Authenticated trade history is persisted in `state/fills.json` and used to
-value existing outcome-token balances at realized cost basis where possible;
-only uncovered balances fall back to current fair value.
+value existing outcome-token balances at realized cost basis. If the persisted
+fill ledger cannot explain the live token balance within the configured
+position tolerance, live mode skips quoting that market for the cycle.
 By default, it also requires a two-sided book with acceptable spread and
 top-of-book depth before quoting. After cancel requests, live mode refreshes
 open orders before posting replacements; after post responses, it only counts
@@ -296,8 +297,8 @@ normal discovery selection.
   Maximum simulated worst-case market loss allowed after existing balances,
   open orders, and the proposed new order are counted. Necessary because
   collateral caps alone do not account for cross-outcome inventory. Existing
-  balances are valued at realized cost basis from the persisted fill ledger
-  where available; only uncovered balances fall back to current fair value.
+  balances are valued at realized cost basis from the persisted fill ledger;
+  live quoting is skipped when the ledger and live balance do not reconcile.
 
   --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
   Default: 25.
@@ -353,4 +354,9 @@ normal discovery selection.
   Default: 10000.
   Maximum fill records retained in the persisted ledger. The oldest records are
   pruned after each live state refresh to keep cycle latency bounded.
+
+  --position-reconcile-tolerance / MARKET_MAKER_POSITION_RECONCILE_TOLERANCE
+  Default: 0.000001.
+  Maximum allowed difference between live token balance and fill-ledger
+  position. Larger mismatches skip live quoting because cost basis is uncertain.
 ```

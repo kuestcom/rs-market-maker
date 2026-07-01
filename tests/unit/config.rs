@@ -140,6 +140,20 @@ fn zero_fill_max_records_is_rejected() {
 }
 
 #[test]
+fn negative_position_reconcile_tolerance_is_rejected() {
+    let mut cli = valid_cli();
+    cli.position_reconcile_tolerance = dec!(-0.000001);
+
+    let error = validate_cli(&cli).expect_err("negative position tolerance should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_POSITION_RECONCILE_TOLERANCE")
+    );
+}
+
+#[test]
 fn invalid_band_margins_are_rejected() {
     let mut cli = valid_cli();
     cli.band_min_margin_ticks = Some(4);
@@ -307,6 +321,7 @@ fn valid_cli() -> Cli {
         state_path: PathBuf::from("state/seen-markets.json"),
         fill_state_path: PathBuf::from("state/fills.json"),
         fill_max_records: 10_000,
+        position_reconcile_tolerance: dec!(0.000001),
     }
 }
 
