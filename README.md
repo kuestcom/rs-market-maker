@@ -66,7 +66,8 @@ blocks quotes whose simulated fill would exceed the configured market loss cap.
 By default, it also requires a two-sided book with acceptable spread and
 top-of-book depth before quoting. After cancel requests, live mode refreshes
 open orders before posting replacements; after post responses, it only counts
-accepted orders as pending local exposure.
+accepted orders as pending local exposure. It also skips live posts when order
+books, balances, or open orders are older than the configured data-age limit.
 
 To cancel scoped live orders without quoting, run:
 
@@ -265,6 +266,12 @@ normal discovery selection.
   --min-free-collateral / MARKET_MAKER_MIN_FREE_COLLATERAL
   Default: 1.
   Collateral buffer left unused after subtracting open buy orders.
+
+  --max-data-age-secs / MARKET_MAKER_MAX_DATA_AGE_SECS
+  Default: 10.
+  Live-mode freshness limit for order books, open orders, token balances, and
+  collateral balance. Necessary because stale inputs can produce duplicate or
+  mis-sized quotes.
 
   --max-open-orders-per-token / MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN
   Default: 2.

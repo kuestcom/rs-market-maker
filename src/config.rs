@@ -129,6 +129,9 @@ pub struct Cli {
     #[arg(long, env = "MARKET_MAKER_MIN_FREE_COLLATERAL", default_value = "1")]
     pub min_free_collateral: Decimal,
 
+    #[arg(long, env = "MARKET_MAKER_MAX_DATA_AGE_SECS", default_value_t = 10)]
+    pub max_data_age_secs: u64,
+
     #[arg(
         long,
         env = "MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN",
@@ -284,6 +287,9 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.min_free_collateral < Decimal::ZERO {
         bail!("MARKET_MAKER_MIN_FREE_COLLATERAL cannot be negative");
+    }
+    if cli.max_data_age_secs == 0 {
+        bail!("MARKET_MAKER_MAX_DATA_AGE_SECS must be greater than zero");
     }
     if cli.max_open_orders_per_token == 0 {
         bail!("MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN must be greater than zero");
