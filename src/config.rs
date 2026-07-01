@@ -199,6 +199,13 @@ pub struct Cli {
         default_value = "state/seen-markets.json"
     )]
     pub state_path: PathBuf,
+
+    #[arg(
+        long,
+        env = "MARKET_MAKER_FILL_STATE_PATH",
+        default_value = "state/fills.json"
+    )]
+    pub fill_state_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -258,6 +265,9 @@ impl Cli {
 pub fn validate_cli(cli: &Cli) -> Result<()> {
     if cli.pause_path.as_os_str().is_empty() {
         bail!("MARKET_MAKER_PAUSE_PATH cannot be empty");
+    }
+    if cli.fill_state_path.as_os_str().is_empty() {
+        bail!("MARKET_MAKER_FILL_STATE_PATH cannot be empty");
     }
     if cli.clear_pause && (cli.cancel_all || cli.cancel_all_on_exit) {
         bail!("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions");

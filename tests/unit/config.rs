@@ -295,6 +295,7 @@ fn valid_cli() -> Cli {
         cycles: 1,
         refresh_secs: 30,
         state_path: PathBuf::from("state/seen-markets.json"),
+        fill_state_path: PathBuf::from("state/fills.json"),
     }
 }
 

@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
+use kuest_client_sdk::types::Decimal;
 use serde::{Deserialize, Serialize};
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -81,5 +82,59 @@ impl PauseState {
 
     fn save(&self, path: &Path) -> Result<()> {
         write_json_pretty(path, self)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FillRecord {
+    pub id: String,
+    pub token_id: String,
+    pub market: String,
+    pub side: String,
+    pub size: Decimal,
+    pub price: Decimal,
+    pub status: String,
+    pub matched_at_unix_secs: i64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct FillLedger {
+    pub trades: BTreeMap<String, FillRecord>,
+}
+
+impl FillLedger {
+    pub fn load(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .with_context(|| format!("failed to parse {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        write_json_pretty(path, self)
+    }
+
+    pub fn upsert(&mut self, record: FillRecord) -> bool {
+        let changed = self.trades.get(&record.id) != Some(&record);
+        if changed {
+            self.trades.insert(record.id.clone(), record);
+        }
+        changed
+    }
+
+    pub fn records_for_token<'a>(&'a self, token_id: &str) -> Vec<&'a FillRecord> {
+        let mut records = self
+            .trades
+            .values()
+            .filter(|record| record.token_id == token_id)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.matched_at_unix_secs
+                .cmp(&right.matched_at_unix_secs)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        records
     }
 }

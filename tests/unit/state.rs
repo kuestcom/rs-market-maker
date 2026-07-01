@@ -1,6 +1,7 @@
 use std::fs;
 
-use rs_market_maker::state::{PauseState, SeenMarkets};
+use rs_market_maker::state::{FillLedger, FillRecord, PauseState, SeenMarkets};
+use rust_decimal_macros::dec;
 
 #[test]
 fn missing_state_file_loads_as_empty() {
@@ -52,6 +53,43 @@ fn pause_state_round_trips_and_clears() {
             .expect("missing pause state should load")
             .is_none()
     );
+}
+
+#[test]
+fn fill_ledger_round_trips_and_filters_by_token() {
+    let path = unique_state_path("fills");
+    let _ = fs::remove_file(&path);
+
+    let mut ledger = FillLedger::default();
+    assert!(ledger.upsert(FillRecord {
+        id: "trade-a".to_owned(),
+        token_id: "1".to_owned(),
+        market: "market-a".to_owned(),
+        side: "BUY".to_owned(),
+        size: dec!(5),
+        price: dec!(0.40),
+        status: "Matched".to_owned(),
+        matched_at_unix_secs: 2,
+    }));
+    assert!(ledger.upsert(FillRecord {
+        id: "trade-b".to_owned(),
+        token_id: "2".to_owned(),
+        market: "market-a".to_owned(),
+        side: "BUY".to_owned(),
+        size: dec!(1),
+        price: dec!(0.50),
+        status: "Matched".to_owned(),
+        matched_at_unix_secs: 1,
+    }));
+    ledger.save(&path).expect("fill ledger should save");
+
+    let loaded = FillLedger::load(&path).expect("fill ledger should load");
+    let token_records = loaded.records_for_token("1");
+
+    assert_eq!(token_records.len(), 1);
+    assert_eq!(token_records[0].id, "trade-a");
+
+    let _ = fs::remove_file(path);
 }
 
 fn unique_state_path(name: &str) -> std::path::PathBuf {
