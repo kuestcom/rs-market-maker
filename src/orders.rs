@@ -1063,9 +1063,8 @@ impl LiveMarketState {
         staged_orders: &[PlannedOrder],
         cli: &Cli,
     ) -> Result<InventoryBuyRoom> {
-        let exposure = self.exposure_with_staged(staged_orders)?;
-        let token_position = exposure.token_position(token_id)?;
-        let market_inventory = exposure.long_inventory();
+        let token_position = self.long_inventory_for_token(token_id, staged_orders)?;
+        let market_inventory = self.long_market_inventory(staged_orders);
         let token_room = max_decimal(cli.max_inventory_per_token - token_position, Decimal::ZERO);
         let market_room = max_decimal(
             cli.max_inventory_per_market - market_inventory,
@@ -1121,6 +1120,36 @@ impl LiveMarketState {
             exposure.apply_order(staged_order.proposed_order)?;
         }
         Ok(exposure)
+    }
+
+    fn long_inventory_for_token(
+        &self,
+        token_id: U256,
+        staged_orders: &[PlannedOrder],
+    ) -> Result<Decimal> {
+        let token_state = self.token_state(token_id)?;
+        Ok(token_long_inventory(
+            token_state.balance,
+            &token_state.open_orders,
+            &self.pending_orders,
+            staged_orders,
+            token_id,
+        ))
+    }
+
+    fn long_market_inventory(&self, staged_orders: &[PlannedOrder]) -> Decimal {
+        self.tokens
+            .iter()
+            .map(|token_state| {
+                token_long_inventory(
+                    token_state.balance,
+                    &token_state.open_orders,
+                    &self.pending_orders,
+                    staged_orders,
+                    token_state.token_id,
+                )
+            })
+            .sum()
     }
 
     fn token_state(&self, token_id: U256) -> Result<&LiveTokenState> {
@@ -1182,21 +1211,6 @@ impl MarketExposure {
 
         max_decimal(cost - proceeds - worst_resolution_payout, Decimal::ZERO)
     }
-
-    fn token_position(&self, token_id: U256) -> Result<Decimal> {
-        self.outcomes
-            .iter()
-            .find(|outcome| outcome.token_id == token_id)
-            .map(|outcome| outcome.position)
-            .with_context(|| format!("missing exposure state for token {token_id}"))
-    }
-
-    fn long_inventory(&self) -> Decimal {
-        self.outcomes
-            .iter()
-            .map(|outcome| max_decimal(outcome.position, Decimal::ZERO))
-            .sum()
-    }
 }
 
 fn apply_order_to_outcome(outcome: &mut OutcomeExposure, order: ProposedOrder) {
@@ -1212,6 +1226,44 @@ fn apply_order_to_outcome(outcome: &mut OutcomeExposure, order: ProposedOrder) {
         Side::Unknown => {}
         _ => {}
     }
+}
+
+fn token_long_inventory(
+    balance: Decimal,
+    open_orders: &[OpenOrderResponse],
+    pending_orders: &[ProposedOrder],
+    staged_orders: &[PlannedOrder],
+    token_id: U256,
+) -> Decimal {
+    max_decimal(balance, Decimal::ZERO)
+        + buy_order_size_for_token(open_orders, token_id)
+        + pending_buy_size_for_token(pending_orders, token_id)
+        + staged_buy_size_for_token(staged_orders, token_id)
+}
+
+fn buy_order_size_for_token(orders: &[OpenOrderResponse], token_id: U256) -> Decimal {
+    orders
+        .iter()
+        .filter(|order| order.asset_id == token_id && order.side == Side::Buy)
+        .map(open_order_remaining_size)
+        .sum()
+}
+
+fn pending_buy_size_for_token(orders: &[ProposedOrder], token_id: U256) -> Decimal {
+    orders
+        .iter()
+        .filter(|order| order.token_id == token_id && order.side == Side::Buy)
+        .map(|order| order.size)
+        .sum()
+}
+
+fn staged_buy_size_for_token(orders: &[PlannedOrder], token_id: U256) -> Decimal {
+    orders
+        .iter()
+        .map(|order| order.proposed_order)
+        .filter(|order| order.token_id == token_id && order.side == Side::Buy)
+        .map(|order| order.size)
+        .sum()
 }
 
 fn market_loss_exceeds_cap(
@@ -1896,6 +1948,43 @@ mod tests {
                 token_position: dec!(15),
                 market_inventory: dec!(15),
                 room: dec!(5)
+            }
+        );
+    }
+
+    #[test]
+    fn inventory_buy_room_ignores_open_sells() {
+        let mut cli = test_cli();
+        cli.max_inventory_per_token = dec!(20);
+        cli.max_inventory_per_market = dec!(50);
+        let mut market_state = test_market_state();
+        market_state.tokens[0].balance = dec!(20);
+        market_state
+            .replace_open_orders(
+                U256::from(1),
+                vec![open_order(
+                    "open-sell",
+                    ProposedOrder {
+                        token_id: U256::from(1),
+                        side: Side::Sell,
+                        price: dec!(0.60),
+                        size: dec!(10),
+                    },
+                )],
+                Instant::now(),
+            )
+            .expect("test token should exist");
+
+        let room = market_state
+            .inventory_buy_room(U256::from(1), &[], &cli)
+            .expect("inventory room should be computed");
+
+        assert_eq!(
+            room,
+            InventoryBuyRoom {
+                token_position: dec!(20),
+                market_inventory: dec!(20),
+                room: Decimal::ZERO
             }
         );
     }
