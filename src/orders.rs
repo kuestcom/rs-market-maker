@@ -50,6 +50,13 @@ pub(crate) struct RiskBudget {
     counted_open_buy_orders: BTreeSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreflightRiskAuditResult {
+    Continue,
+    SkipCycle,
+    Stop,
+}
+
 impl RiskBudget {
     pub(crate) fn new(collateral_limit: Decimal) -> Self {
         Self {
@@ -109,7 +116,9 @@ struct QuoteBand {
 #[derive(Clone, Debug)]
 struct TokenQuote {
     token_id: U256,
+    outcome: String,
     fair_price: Decimal,
+    book_fetched_at: Instant,
     plan: Option<QuotePlan>,
     skip_reason: Option<String>,
 }
@@ -128,6 +137,12 @@ struct LiveTokenState {
     balance_fetched_at: Instant,
     open_orders: Vec<OpenOrderResponse>,
     open_orders_fetched_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct OpenBuyCollateral {
+    order_ids: BTreeSet<String>,
+    collateral: Decimal,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -254,34 +269,22 @@ pub(crate) async fn quote_market(
     global_budget: &mut RiskBudget,
 ) -> Result<()> {
     let mut market_budget = RiskBudget::new(cli.max_collateral_per_market);
-    let mut token_quotes = Vec::new();
+    let token_quotes = build_market_token_quotes(public_client, market, cli).await?;
 
-    for token in &market.tokens {
-        let request = OrderBookSummaryRequest::builder()
-            .token_id(token.token_id)
-            .build();
-        let book = public_client
-            .order_book(&request)
-            .await
-            .with_context(|| format!("failed to fetch order book for token {}", token.token_id))?;
-        let book_fetched_at = Instant::now();
-        let token_quote = build_token_quote(market, token, &book, book_fetched_at, cli);
-
+    for token_quote in &token_quotes {
         if let Some(plan) = &token_quote.plan {
             print_plan(plan, cli.live);
         } else {
             println!(
                 "skip {} {}: {}",
                 market.market_slug,
-                token.outcome,
+                token_quote.outcome,
                 token_quote
                     .skip_reason
                     .as_deref()
                     .unwrap_or("no safe quote at configured edge/sides")
             );
         }
-
-        token_quotes.push(token_quote);
     }
 
     if let Some(live) = live {
@@ -308,6 +311,126 @@ pub(crate) async fn quote_market(
     }
 
     Ok(())
+}
+
+pub(crate) async fn preflight_risk_audit(
+    public_client: &PublicClient,
+    live: &LiveTrading,
+    markets: &[MarketResponse],
+    cli: &Cli,
+) -> Result<PreflightRiskAuditResult> {
+    if markets.is_empty() {
+        return Ok(PreflightRiskAuditResult::Continue);
+    }
+
+    println!("preflight risk audit: checking {} markets", markets.len());
+    let mut global_open_buys = OpenBuyCollateral::default();
+    let mut scanned_markets = Vec::new();
+
+    for market in markets {
+        if let Some(pause) = PauseState::load(&cli.pause_path)? {
+            println!(
+                "preflight risk audit stopped by {}: {}",
+                cli.pause_path.display(),
+                pause.reason.trim()
+            );
+            return Ok(PreflightRiskAuditResult::Stop);
+        }
+
+        let token_quotes = match build_market_token_quotes(public_client, market, cli).await {
+            Ok(token_quotes) => token_quotes,
+            Err(error) => {
+                println!(
+                    "preflight risk audit skip {}: failed to fetch order books ({error:#})",
+                    market.market_slug
+                );
+                return Ok(PreflightRiskAuditResult::SkipCycle);
+            }
+        };
+        let market_state = match LiveMarketState::load(live, &token_quotes).await {
+            Ok(market_state) => market_state,
+            Err(error) => {
+                println!(
+                    "preflight risk audit skip {}: failed to fetch live state ({error:#})",
+                    market.market_slug
+                );
+                return Ok(PreflightRiskAuditResult::SkipCycle);
+            }
+        };
+        if let Some(reason) =
+            preflight_stale_data_reason(&token_quotes, &market_state, Instant::now(), cli)?
+        {
+            println!(
+                "preflight risk audit skip {}: stale live data ({reason})",
+                market.market_slug
+            );
+            return Ok(PreflightRiskAuditResult::SkipCycle);
+        }
+
+        global_open_buys.reserve_market_state(&market_state);
+        let breaches = market_state.risk_breaches(cli);
+        if !breaches.is_empty() {
+            print_preflight_risk_breaches(market, &breaches);
+            if cli.cancel_on_risk_breach {
+                cancel_risk_increasing_market_orders(live, market, cli, &market_state).await?;
+            }
+            if cli.pause_on_risk_breach {
+                let reason = preflight_breach_pause_reason(market, &breaches);
+                PauseState::save_reason(&cli.pause_path, reason.clone())?;
+                println!("wrote pause file {}: {reason}", cli.pause_path.display());
+            }
+            return Ok(PreflightRiskAuditResult::Stop);
+        }
+
+        scanned_markets.push((market.clone(), market_state));
+    }
+
+    if global_open_buys.collateral() > cli.max_total_collateral {
+        let collateral = global_open_buys.collateral();
+        println!(
+            "preflight risk breach: total open buy collateral {} exceeds limit {}",
+            collateral, cli.max_total_collateral
+        );
+        if cli.cancel_on_risk_breach {
+            for (market, market_state) in &scanned_markets {
+                cancel_risk_increasing_market_orders(live, market, cli, market_state).await?;
+            }
+        }
+        if cli.pause_on_risk_breach {
+            let reason = format!(
+                "preflight risk breach: total open buy collateral {} exceeds limit {}",
+                collateral, cli.max_total_collateral
+            );
+            PauseState::save_reason(&cli.pause_path, reason.clone())?;
+            println!("wrote pause file {}: {reason}", cli.pause_path.display());
+        }
+        return Ok(PreflightRiskAuditResult::Stop);
+    }
+
+    Ok(PreflightRiskAuditResult::Continue)
+}
+
+async fn build_market_token_quotes(
+    public_client: &PublicClient,
+    market: &MarketResponse,
+    cli: &Cli,
+) -> Result<Vec<TokenQuote>> {
+    let mut token_quotes = Vec::new();
+
+    for token in &market.tokens {
+        let request = OrderBookSummaryRequest::builder()
+            .token_id(token.token_id)
+            .build();
+        let book = public_client
+            .order_book(&request)
+            .await
+            .with_context(|| format!("failed to fetch order book for token {}", token.token_id))?;
+        let book_fetched_at = Instant::now();
+        let token_quote = build_token_quote(market, token, &book, book_fetched_at, cli);
+        token_quotes.push(token_quote);
+    }
+
+    Ok(token_quotes)
 }
 
 fn build_token_quote(
@@ -342,9 +465,33 @@ fn build_token_quote(
 
     TokenQuote {
         token_id: token.token_id,
+        outcome: token.outcome.clone(),
         fair_price,
+        book_fetched_at,
         plan,
         skip_reason,
+    }
+}
+
+impl OpenBuyCollateral {
+    fn reserve_market_state(&mut self, market_state: &LiveMarketState) {
+        for token_state in &market_state.tokens {
+            for order in &token_state.open_orders {
+                self.reserve_open_buy_order(order);
+            }
+        }
+    }
+
+    fn reserve_open_buy_order(&mut self, order: &OpenOrderResponse) {
+        if order.side != Side::Buy || !self.order_ids.insert(order.id.clone()) {
+            return;
+        }
+
+        self.collateral += open_order_remaining_size(order) * order.price;
+    }
+
+    fn collateral(&self) -> Decimal {
+        self.collateral
     }
 }
 
@@ -1383,6 +1530,16 @@ fn print_risk_breaches(plan: &QuotePlan, breaches: &[RiskBreach]) {
     }
 }
 
+fn print_preflight_risk_breaches(market: &MarketResponse, breaches: &[RiskBreach]) {
+    for breach in breaches {
+        println!(
+            "preflight risk breach {}: {}",
+            market.market_slug,
+            breach.message()
+        );
+    }
+}
+
 fn risk_breach_pause_reason(plan: &QuotePlan, breaches: &[RiskBreach]) -> String {
     let messages = breaches
         .iter()
@@ -1393,6 +1550,15 @@ fn risk_breach_pause_reason(plan: &QuotePlan, breaches: &[RiskBreach]) -> String
         "risk breach {} {}: {messages}",
         plan.market_slug, plan.outcome
     )
+}
+
+fn preflight_breach_pause_reason(market: &MarketResponse, breaches: &[RiskBreach]) -> String {
+    let messages = breaches
+        .iter()
+        .map(RiskBreach::message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("preflight risk breach {}: {messages}", market.market_slug)
 }
 
 impl RiskBreach {
@@ -1458,12 +1624,75 @@ async fn cancel_risk_increasing_orders(
     Ok(Some(open_orders_for_token(live, plan.token_id).await?))
 }
 
+async fn cancel_risk_increasing_market_orders(
+    live: &LiveTrading,
+    market: &MarketResponse,
+    cli: &Cli,
+    market_state: &LiveMarketState,
+) -> Result<()> {
+    let order_ids = market_state
+        .tokens
+        .iter()
+        .flat_map(|token| token.open_orders.iter())
+        .filter(|order| order.side == Side::Buy)
+        .map(|order| order.id.as_str())
+        .collect::<Vec<_>>();
+    if order_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut canceled = 0usize;
+    let mut not_canceled = 0usize;
+    for batch in order_ids.chunks(CANCEL_ORDER_BATCH_SIZE) {
+        if skip_market_live_action_if_paused(
+            market,
+            cli,
+            "canceling preflight risk-increasing orders",
+        )? {
+            return Ok(());
+        }
+        let response = live.client.cancel_orders(batch).await.with_context(|| {
+            format!(
+                "failed to cancel preflight risk-increasing buy orders for market {}",
+                market.market_slug
+            )
+        })?;
+        canceled += response.canceled.len();
+        not_canceled += response.not_canceled.len();
+    }
+
+    println!(
+        "preflight risk cancel {}: canceled={} not_canceled={}",
+        market.market_slug, canceled, not_canceled
+    );
+
+    Ok(())
+}
+
 fn skip_live_action_if_paused(plan: &QuotePlan, cli: &Cli, action: &str) -> Result<bool> {
     if let Some(pause) = PauseState::load(&cli.pause_path)? {
         println!(
             "skip {action} for {} {}: pause active at {} ({})",
             plan.market_slug,
             plan.outcome,
+            cli.pause_path.display(),
+            pause.reason.trim()
+        );
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn skip_market_live_action_if_paused(
+    market: &MarketResponse,
+    cli: &Cli,
+    action: &str,
+) -> Result<bool> {
+    if let Some(pause) = PauseState::load(&cli.pause_path)? {
+        println!(
+            "skip {action} for {}: pause active at {} ({})",
+            market.market_slug,
             cli.pause_path.display(),
             pause.reason.trim()
         );
@@ -1818,6 +2047,41 @@ fn stale_live_data_reason(
     )
 }
 
+fn preflight_stale_data_reason(
+    token_quotes: &[TokenQuote],
+    market_state: &LiveMarketState,
+    now: Instant,
+    cli: &Cli,
+) -> Result<Option<String>> {
+    let max_age = Duration::from_secs(cli.max_data_age_secs);
+    for token_quote in token_quotes {
+        let token_state = market_state.token_state(token_quote.token_id)?;
+        if let Some(reason) =
+            stale_input_reason("order book", token_quote.book_fetched_at, now, max_age)
+                .or_else(|| {
+                    stale_input_reason(
+                        "open orders",
+                        token_state.open_orders_fetched_at,
+                        now,
+                        max_age,
+                    )
+                })
+                .or_else(|| {
+                    stale_input_reason(
+                        "token balance",
+                        token_state.balance_fetched_at,
+                        now,
+                        max_age,
+                    )
+                })
+        {
+            return Ok(Some(format!("token {} {reason}", token_quote.token_id)));
+        }
+    }
+
+    Ok(None)
+}
+
 fn stale_input_reason(
     input: &str,
     fetched_at: Instant,
@@ -1925,6 +2189,25 @@ mod tests {
         budget.reserve_open_buy_order(&order);
 
         assert_eq!(budget.remaining_collateral(), dec!(8));
+    }
+
+    #[test]
+    fn open_buy_collateral_audit_dedupes_order_ids() {
+        let order = open_order(
+            "open-buy",
+            ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            },
+        );
+        let mut audit = OpenBuyCollateral::default();
+
+        audit.reserve_open_buy_order(&order);
+        audit.reserve_open_buy_order(&order);
+
+        assert_eq!(audit.collateral(), dec!(2));
     }
 
     #[test]
@@ -2364,6 +2647,28 @@ mod tests {
         );
 
         assert!(reason.is_none());
+    }
+
+    #[test]
+    fn preflight_stale_data_reason_flags_stale_token_inputs() {
+        let now = Instant::now();
+        let cli = test_cli();
+        let token_quotes = vec![TokenQuote {
+            token_id: U256::from(1),
+            outcome: "YES".to_owned(),
+            fair_price: dec!(0.50),
+            book_fetched_at: now,
+            plan: None,
+            skip_reason: None,
+        }];
+        let mut market_state = test_market_state();
+        market_state.tokens[0].open_orders_fetched_at = now - Duration::from_secs(11);
+
+        let reason = preflight_stale_data_reason(&token_quotes, &market_state, now, &cli)
+            .expect("stale data check should succeed")
+            .expect("stale input should be rejected");
+
+        assert!(reason.contains("open orders"));
     }
 
     fn level(price: Decimal, size: Decimal) -> OrderSummary {
