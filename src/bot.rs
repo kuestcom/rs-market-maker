@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -110,13 +111,16 @@ async fn run_cycles(
             continue;
         }
 
-        let mut risk_budget = if let Some(live) = live {
+        let (mut risk_budget, mut preflight_snapshots) = if let Some(live) = live {
             let markets = candidates
                 .iter()
                 .map(|candidate| candidate.market.clone())
                 .collect::<Vec<_>>();
             match preflight_risk_audit(public_client, live, &markets, cli).await? {
-                PreflightRiskAuditResult::Continue(risk_budget) => risk_budget,
+                PreflightRiskAuditResult::Continue {
+                    risk_budget,
+                    snapshots,
+                } => (risk_budget, VecDeque::from(snapshots)),
                 PreflightRiskAuditResult::SkipCycle => {
                     if cycle < cli.cycles {
                         sleep(Duration::from_secs(cli.refresh_secs)).await;
@@ -126,15 +130,25 @@ async fn run_cycles(
                 PreflightRiskAuditResult::Stop => return Ok(()),
             }
         } else {
-            RiskBudget::new(cli.max_total_collateral)
+            (RiskBudget::new(cli.max_total_collateral), VecDeque::new())
         };
 
         for candidate in candidates {
+            let preflight_snapshot = if live.is_some() {
+                Some(
+                    preflight_snapshots
+                        .pop_front()
+                        .context("missing preflight snapshot for live quote")?,
+                )
+            } else {
+                None
+            };
             quote_market(
                 public_client,
                 live,
                 &candidate.market,
                 cli,
+                preflight_snapshot,
                 &mut risk_budget,
             )
             .await?;
