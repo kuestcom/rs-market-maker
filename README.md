@@ -64,7 +64,9 @@ collateral already locked by live buy orders, checks sell orders against
 available outcome-token balance, respects configured collateral caps, and
 blocks quotes whose simulated fill would exceed the configured market loss cap.
 By default, it also requires a two-sided book with acceptable spread and
-top-of-book depth before quoting.
+top-of-book depth before quoting. After cancel requests, live mode refreshes
+open orders before posting replacements; after post responses, it only counts
+accepted orders as pending local exposure.
 
 To cancel scoped live orders without quoting, run:
 

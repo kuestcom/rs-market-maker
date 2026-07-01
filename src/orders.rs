@@ -12,7 +12,9 @@ use kuest_client_sdk::clob::types::response::{
     MarketResponse, OpenOrderResponse, OrderBookSummaryResponse, OrderSummary, PostOrderResponse,
     Token,
 };
-use kuest_client_sdk::clob::types::{AssetType, OrderStatusType, OrderType, Side, SignatureType};
+use kuest_client_sdk::clob::types::{
+    AssetType, OrderStatusType, OrderType, Side, SignatureType, SignedOrder,
+};
 use kuest_client_sdk::clob::{Client, Config};
 use kuest_client_sdk::types::{Address, Decimal, U256};
 use tokio::time::sleep;
@@ -129,6 +131,21 @@ struct ProposedOrder {
     side: Side,
     price: Decimal,
     size: Decimal,
+}
+
+#[derive(Debug)]
+struct PlannedOrder {
+    side: Side,
+    proposed_order: ProposedOrder,
+    signed_order: SignedOrder,
+    collateral: Decimal,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SubmittedOrder {
+    side: Side,
+    proposed_order: ProposedOrder,
+    collateral: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -564,7 +581,7 @@ async fn reconcile_quote_plan(
     market_budget: &mut RiskBudget,
     market_state: &mut LiveMarketState,
 ) -> Result<()> {
-    let open_orders = market_state.open_orders(plan.token_id)?.to_vec();
+    let mut open_orders = market_state.open_orders(plan.token_id)?.to_vec();
     let orders_to_cancel = cancellable_orders(&open_orders, plan, cli);
     if cli.cancel_before_quote && !orders_to_cancel.is_empty() {
         let order_ids = orders_to_cancel
@@ -591,19 +608,26 @@ async fn reconcile_quote_plan(
             );
             return Ok(());
         }
+
+        let canceled_ids = orders_to_cancel
+            .iter()
+            .map(|order| order.id.clone())
+            .collect::<BTreeSet<_>>();
+        open_orders = open_orders_for_token(live, plan.token_id).await?;
+        market_state.replace_open_orders(plan.token_id, open_orders.clone())?;
+        if open_orders
+            .iter()
+            .any(|order| canceled_ids.contains(&order.id))
+        {
+            println!(
+                "skip placing {} {}: canceled order state is still unstable",
+                plan.market_slug, plan.outcome
+            );
+            return Ok(());
+        }
     }
 
-    let canceled_ids = orders_to_cancel
-        .iter()
-        .map(|order| order.id.clone())
-        .collect::<BTreeSet<_>>();
-    drop(orders_to_cancel);
-    let remaining_orders = open_orders
-        .into_iter()
-        .filter(|order| !canceled_ids.contains(&order.id))
-        .collect::<Vec<_>>();
-    market_state.replace_open_orders(plan.token_id, remaining_orders.clone())?;
-    let remaining_orders = remaining_orders.iter().collect::<Vec<_>>();
+    let remaining_orders = open_orders.iter().collect::<Vec<_>>();
 
     for order in &remaining_orders {
         global_budget.reserve_open_buy_order(order);
@@ -633,7 +657,7 @@ async fn reconcile_quote_plan(
         .max_open_orders_per_token
         .saturating_sub(kept_order_count);
 
-    let mut orders = Vec::new();
+    let mut planned_orders = Vec::new();
     if let Some(band) = &plan.buy_band
         && new_order_slots > 0
     {
@@ -653,7 +677,13 @@ async fn reconcile_quote_plan(
                         price: band.price,
                         size,
                     };
-                    if !market_loss_exceeds_cap(plan, proposed_order, market_state, cli)? {
+                    if !market_loss_exceeds_cap(
+                        plan,
+                        proposed_order,
+                        market_state,
+                        &planned_orders,
+                        cli,
+                    )? {
                         let order = live
                             .client
                             .limit_order()
@@ -668,9 +698,12 @@ async fn reconcile_quote_plan(
                             .with_context(|| {
                                 format!("failed to build buy order for token {}", plan.token_id)
                             })?;
-                        reserve_buy_collateral(collateral, global_budget, market_budget);
-                        market_state.record_pending_order(proposed_order);
-                        orders.push((Side::Buy, live.client.sign(&live.signer, order).await?));
+                        planned_orders.push(PlannedOrder {
+                            side: Side::Buy,
+                            proposed_order,
+                            signed_order: live.client.sign(&live.signer, order).await?,
+                            collateral,
+                        });
                         new_order_slots -= 1;
                     }
                 }
@@ -697,7 +730,13 @@ async fn reconcile_quote_plan(
                     price: band.price,
                     size,
                 };
-                if !market_loss_exceeds_cap(plan, proposed_order, market_state, cli)? {
+                if !market_loss_exceeds_cap(
+                    plan,
+                    proposed_order,
+                    market_state,
+                    &planned_orders,
+                    cli,
+                )? {
                     let order = live
                         .client
                         .limit_order()
@@ -712,8 +751,12 @@ async fn reconcile_quote_plan(
                         .with_context(|| {
                             format!("failed to build sell order for token {}", plan.token_id)
                         })?;
-                    market_state.record_pending_order(proposed_order);
-                    orders.push((Side::Sell, live.client.sign(&live.signer, order).await?));
+                    planned_orders.push(PlannedOrder {
+                        side: Side::Sell,
+                        proposed_order,
+                        signed_order: live.client.sign(&live.signer, order).await?,
+                        collateral: Decimal::ZERO,
+                    });
                 }
             } else {
                 println!(
@@ -724,18 +767,35 @@ async fn reconcile_quote_plan(
         }
     }
 
-    if orders.is_empty() {
+    if planned_orders.is_empty() {
         return Ok(());
     }
 
-    let sides = orders.iter().map(|(side, _)| *side).collect::<Vec<_>>();
-    let signed_orders = orders
-        .into_iter()
-        .map(|(_, order)| order)
-        .collect::<Vec<_>>();
+    let mut submitted_orders = Vec::with_capacity(planned_orders.len());
+    let mut signed_orders = Vec::with_capacity(planned_orders.len());
+    for planned_order in planned_orders {
+        submitted_orders.push(SubmittedOrder {
+            side: planned_order.side,
+            proposed_order: planned_order.proposed_order,
+            collateral: planned_order.collateral,
+        });
+        signed_orders.push(planned_order.signed_order);
+    }
     let responses = live.client.post_orders(signed_orders).await?;
-    let responses = sides.into_iter().zip(responses).collect::<Vec<_>>();
+    let responses = submitted_orders
+        .into_iter()
+        .zip(responses)
+        .collect::<Vec<_>>();
     print_post_responses(plan, &responses);
+    apply_post_responses(
+        live,
+        plan,
+        responses,
+        global_budget,
+        market_budget,
+        market_state,
+    )
+    .await?;
 
     Ok(())
 }
@@ -885,8 +945,23 @@ impl LiveMarketState {
         Ok(())
     }
 
-    fn projected_loss(&self, order: ProposedOrder) -> Result<Decimal> {
+    fn remove_pending_orders_now_open(&mut self, open_orders: &[OpenOrderResponse]) {
+        self.pending_orders.retain(|pending_order| {
+            !open_orders
+                .iter()
+                .any(|open_order| open_order_matches_proposed(open_order, *pending_order))
+        });
+    }
+
+    fn projected_loss_with_staged(
+        &self,
+        order: ProposedOrder,
+        staged_orders: &[PlannedOrder],
+    ) -> Result<Decimal> {
         let mut exposure = self.exposure();
+        for staged_order in staged_orders {
+            exposure.apply_order(staged_order.proposed_order)?;
+        }
         exposure.apply_order(order)?;
         Ok(exposure.worst_loss())
     }
@@ -1007,9 +1082,10 @@ fn market_loss_exceeds_cap(
     plan: &QuotePlan,
     proposed_order: ProposedOrder,
     market_state: &LiveMarketState,
+    staged_orders: &[PlannedOrder],
     cli: &Cli,
 ) -> Result<bool> {
-    let projected_loss = market_state.projected_loss(proposed_order)?;
+    let projected_loss = market_state.projected_loss_with_staged(proposed_order, staged_orders)?;
     if projected_loss <= cli.max_loss_per_market {
         return Ok(false);
     }
@@ -1248,12 +1324,70 @@ fn is_open_order(order: &OpenOrderResponse) -> bool {
     )
 }
 
-fn print_post_responses(plan: &QuotePlan, responses: &[(Side, PostOrderResponse)]) {
-    for (side, response) in responses {
+async fn apply_post_responses(
+    live: &LiveTrading,
+    plan: &QuotePlan,
+    responses: Vec<(SubmittedOrder, PostOrderResponse)>,
+    global_budget: &mut RiskBudget,
+    market_budget: &mut RiskBudget,
+    market_state: &mut LiveMarketState,
+) -> Result<()> {
+    let mut has_failed_response = false;
+    for (submitted_order, response) in responses {
+        has_failed_response |= apply_post_response(
+            submitted_order,
+            &response,
+            global_budget,
+            market_budget,
+            market_state,
+        );
+    }
+
+    if has_failed_response {
+        let refreshed_orders = open_orders_for_token(live, plan.token_id).await?;
+        market_state.remove_pending_orders_now_open(&refreshed_orders);
+        market_state.replace_open_orders(plan.token_id, refreshed_orders)?;
         println!(
-            "posted {} {} side={side:?} order_id={} success={} status={:?} error={:?}",
+            "post state refreshed for {} {} after rejected order response",
+            plan.market_slug, plan.outcome
+        );
+    }
+
+    Ok(())
+}
+
+fn apply_post_response(
+    submitted_order: SubmittedOrder,
+    response: &PostOrderResponse,
+    global_budget: &mut RiskBudget,
+    market_budget: &mut RiskBudget,
+    market_state: &mut LiveMarketState,
+) -> bool {
+    if !response.success {
+        return true;
+    }
+
+    if submitted_order.side == Side::Buy {
+        reserve_buy_collateral(submitted_order.collateral, global_budget, market_budget);
+    }
+    market_state.record_pending_order(submitted_order.proposed_order);
+    false
+}
+
+fn open_order_matches_proposed(order: &OpenOrderResponse, proposed_order: ProposedOrder) -> bool {
+    order.asset_id == proposed_order.token_id
+        && order.side == proposed_order.side
+        && order.price == proposed_order.price
+        && open_order_remaining_size(order) == proposed_order.size
+}
+
+fn print_post_responses(plan: &QuotePlan, responses: &[(SubmittedOrder, PostOrderResponse)]) {
+    for (submitted_order, response) in responses {
+        println!(
+            "posted {} {} side={:?} order_id={} success={} status={:?} error={:?}",
             plan.market_slug,
             plan.outcome,
+            submitted_order.side,
             response.order_id,
             response.success,
             response.status,
@@ -1510,8 +1644,152 @@ mod tests {
         assert_eq!(band_missing_size(&band, dec!(9)), None);
     }
 
+    #[test]
+    fn accepted_buy_post_reserves_budget_and_records_pending_order() {
+        let mut global_budget = RiskBudget::new(dec!(10));
+        let mut market_budget = RiskBudget::new(dec!(10));
+        let mut market_state = test_market_state();
+        let submitted_order = SubmittedOrder {
+            side: Side::Buy,
+            proposed_order: ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            },
+            collateral: dec!(2),
+        };
+        let response = post_response(true);
+
+        let failed = apply_post_response(
+            submitted_order,
+            &response,
+            &mut global_budget,
+            &mut market_budget,
+            &mut market_state,
+        );
+
+        assert!(!failed);
+        assert_eq!(global_budget.remaining_collateral(), dec!(8));
+        assert_eq!(market_budget.remaining_collateral(), dec!(8));
+        assert_eq!(market_state.pending_orders.len(), 1);
+    }
+
+    #[test]
+    fn rejected_post_does_not_reserve_budget_or_record_pending_order() {
+        let mut global_budget = RiskBudget::new(dec!(10));
+        let mut market_budget = RiskBudget::new(dec!(10));
+        let mut market_state = test_market_state();
+        let submitted_order = SubmittedOrder {
+            side: Side::Buy,
+            proposed_order: ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            },
+            collateral: dec!(2),
+        };
+        let response = post_response(false);
+
+        let failed = apply_post_response(
+            submitted_order,
+            &response,
+            &mut global_budget,
+            &mut market_budget,
+            &mut market_state,
+        );
+
+        assert!(failed);
+        assert_eq!(global_budget.remaining_collateral(), dec!(10));
+        assert_eq!(market_budget.remaining_collateral(), dec!(10));
+        assert!(market_state.pending_orders.is_empty());
+    }
+
+    #[test]
+    fn pending_order_is_removed_when_refreshed_open_order_matches_it() {
+        let mut market_state = test_market_state();
+        let proposed_order = ProposedOrder {
+            token_id: U256::from(1),
+            side: Side::Buy,
+            price: dec!(0.40),
+            size: dec!(5),
+        };
+        market_state.record_pending_order(proposed_order);
+        let refreshed_orders = vec![open_order("posted-order", proposed_order)];
+
+        market_state.remove_pending_orders_now_open(&refreshed_orders);
+        market_state
+            .replace_open_orders(U256::from(1), refreshed_orders)
+            .expect("test token should exist");
+
+        assert!(market_state.pending_orders.is_empty());
+        assert_eq!(
+            market_state
+                .open_orders(U256::from(1))
+                .expect("test token should exist")
+                .len(),
+            1
+        );
+        assert_eq!(market_state.exposure().worst_loss(), dec!(2));
+    }
+
     fn level(price: Decimal, size: Decimal) -> OrderSummary {
         OrderSummary::builder().price(price).size(size).build()
+    }
+
+    fn open_order(id: &str, proposed_order: ProposedOrder) -> OpenOrderResponse {
+        OpenOrderResponse::builder()
+            .id(id)
+            .status(OrderStatusType::Live)
+            .owner("01HAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .maker_address(Address::ZERO)
+            .market(Default::default())
+            .asset_id(proposed_order.token_id)
+            .side(proposed_order.side)
+            .original_size(proposed_order.size)
+            .size_matched(Decimal::ZERO)
+            .price(proposed_order.price)
+            .associate_trades(Vec::new())
+            .outcome("YES")
+            .created_at("2024-01-15T12:34:56Z".parse().unwrap())
+            .expiration("2024-01-20T00:00:00Z".parse().unwrap())
+            .order_type(OrderType::GTC)
+            .build()
+    }
+
+    fn post_response(success: bool) -> PostOrderResponse {
+        PostOrderResponse::builder()
+            .making_amount(Decimal::ZERO)
+            .taking_amount(Decimal::ZERO)
+            .order_id("0x1")
+            .status(if success {
+                OrderStatusType::Live
+            } else {
+                OrderStatusType::Unknown("rejected".to_owned())
+            })
+            .success(success)
+            .build()
+    }
+
+    fn test_market_state() -> LiveMarketState {
+        LiveMarketState {
+            tokens: vec![
+                LiveTokenState {
+                    token_id: U256::from(1),
+                    fair_price: dec!(0.50),
+                    balance: Decimal::ZERO,
+                    open_orders: Vec::new(),
+                },
+                LiveTokenState {
+                    token_id: U256::from(2),
+                    fair_price: dec!(0.50),
+                    balance: Decimal::ZERO,
+                    open_orders: Vec::new(),
+                },
+            ],
+            pending_orders: Vec::new(),
+        }
     }
 
     fn test_cli() -> Cli {
