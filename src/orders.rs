@@ -22,6 +22,7 @@ use tokio::time::sleep;
 use crate::config::Cli;
 use crate::discovery::market_key;
 use crate::pricing::{best_ask, best_bid, fair_price, max_decimal, min_decimal};
+use crate::state::PauseState;
 use crate::{AuthClient, PublicClient};
 
 const TERMINAL_CURSOR: &str = "LTE=";
@@ -287,6 +288,9 @@ pub(crate) async fn quote_market(
         let mut market_state = LiveMarketState::load(live, &token_quotes).await?;
         for token_quote in &token_quotes {
             if let Some(plan) = &token_quote.plan {
+                if PauseState::load(&cli.pause_path)?.is_some() {
+                    return Ok(());
+                }
                 reconcile_quote_plan(
                     live,
                     plan,
@@ -296,6 +300,9 @@ pub(crate) async fn quote_market(
                     &mut market_state,
                 )
                 .await?;
+                if PauseState::load(&cli.pause_path)?.is_some() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -696,6 +703,11 @@ async fn reconcile_quote_plan(
                 refreshed_orders,
                 open_orders_fetched_at,
             )?;
+        }
+        if cli.pause_on_risk_breach {
+            let reason = risk_breach_pause_reason(plan, &breaches);
+            PauseState::save_reason(&cli.pause_path, reason.clone())?;
+            println!("wrote pause file {}: {reason}", cli.pause_path.display());
         }
         return Ok(());
     }
@@ -1363,6 +1375,18 @@ fn print_risk_breaches(plan: &QuotePlan, breaches: &[RiskBreach]) {
             breach.message()
         );
     }
+}
+
+fn risk_breach_pause_reason(plan: &QuotePlan, breaches: &[RiskBreach]) -> String {
+    let messages = breaches
+        .iter()
+        .map(RiskBreach::message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "risk breach {} {}: {messages}",
+        plan.market_slug, plan.outcome
+    )
 }
 
 impl RiskBreach {
@@ -2407,6 +2431,9 @@ mod tests {
             cancel_all: false,
             cancel_all_on_exit: false,
             cancel_on_risk_breach: false,
+            pause_on_risk_breach: false,
+            clear_pause: false,
+            pause_path: PathBuf::from("state/paused.json"),
             post_only: true,
             require_two_sided_live: true,
             min_price: dec!(0.05),

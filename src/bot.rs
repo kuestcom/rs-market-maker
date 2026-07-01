@@ -15,11 +15,21 @@ use crate::discovery::{
 use crate::orders::{
     CancelOpenOrdersSummary, RiskBudget, authenticate, cancel_open_orders_for_markets, quote_market,
 };
-use crate::state::SeenMarkets;
+use crate::state::{PauseState, SeenMarkets};
 
 type ManagedScope = Arc<Mutex<Vec<MarketResponse>>>;
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if cli.clear_pause {
+        let cleared = PauseState::clear(&cli.pause_path)?;
+        if cleared {
+            println!("cleared pause file {}", cli.pause_path.display());
+        } else {
+            println!("no pause file at {}", cli.pause_path.display());
+        }
+        return Ok(());
+    }
+
     let public_client = Client::new(&cli.clob_host, Config::default())
         .with_context(|| format!("failed to create CLOB client for {}", cli.clob_host))?;
     let live = if cli.live {
@@ -59,6 +69,10 @@ async fn run_cycles(
     let mut seen = SeenMarkets::load(&cli.state_path)?;
 
     for cycle in 1..=cli.cycles {
+        if stop_if_paused(cli)? {
+            return Ok(());
+        }
+
         let candidates = discover_cycle_candidates(public_client, cli, &mut seen, cycle).await?;
         replace_managed_scope(managed_scope.as_ref(), &candidates)?;
 
@@ -103,6 +117,9 @@ async fn run_cycles(
                 &mut risk_budget,
             )
             .await?;
+            if stop_if_paused(cli)? {
+                return Ok(());
+            }
         }
 
         if cycle < cli.cycles {
@@ -111,6 +128,19 @@ async fn run_cycles(
     }
 
     Ok(())
+}
+
+fn stop_if_paused(cli: &Cli) -> Result<bool> {
+    if let Some(pause) = PauseState::load(&cli.pause_path)? {
+        println!(
+            "paused by {}: {}",
+            cli.pause_path.display(),
+            pause.reason.trim()
+        );
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 async fn discover_cycle_candidates(

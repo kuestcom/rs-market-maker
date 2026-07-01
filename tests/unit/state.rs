@@ -1,6 +1,6 @@
 use std::fs;
 
-use rs_market_maker::state::SeenMarkets;
+use rs_market_maker::state::{PauseState, SeenMarkets};
 
 #[test]
 fn missing_state_file_loads_as_empty() {
@@ -30,6 +30,28 @@ fn state_round_trips_seen_markets() {
     assert!(loaded.markets.contains("market-b"));
 
     let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn pause_state_round_trips_and_clears() {
+    let path = unique_state_path("pause");
+    let _ = fs::remove_file(&path);
+
+    let saved =
+        PauseState::save_reason(&path, "risk breach test").expect("pause state should save");
+    let loaded = PauseState::load(&path)
+        .expect("pause state should load")
+        .expect("pause state should exist");
+
+    assert_eq!(loaded.reason, "risk breach test");
+    assert_eq!(loaded.created_at_unix_secs, saved.created_at_unix_secs);
+    assert!(PauseState::clear(&path).expect("pause state should clear"));
+    assert!(!PauseState::clear(&path).expect("missing pause state should be ok"));
+    assert!(
+        PauseState::load(&path)
+            .expect("missing pause state should load")
+            .is_none()
+    );
 }
 
 fn unique_state_path(name: &str) -> std::path::PathBuf {

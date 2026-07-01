@@ -179,6 +179,30 @@ fn cancel_on_risk_breach_requires_live_mode() {
 }
 
 #[test]
+fn pause_on_risk_breach_requires_live_mode() {
+    let mut cli = valid_cli();
+    cli.pause_on_risk_breach = true;
+
+    let error = validate_cli(&cli).expect_err("pause on risk breach without live mode should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_PAUSE_ON_RISK_BREACH")
+    );
+}
+
+#[test]
+fn clear_pause_skips_trading_validation() {
+    let mut cli = valid_cli();
+    cli.clear_pause = true;
+    cli.live = true;
+    cli.order_size = Decimal::ZERO;
+
+    validate_cli(&cli).expect("clear pause should only require a valid pause path");
+}
+
+#[test]
 fn cancel_all_modes_are_mutually_exclusive() {
     let mut cli = valid_live_cli();
     cli.cancel_all = true;
@@ -218,6 +242,9 @@ fn valid_cli() -> Cli {
         cancel_all: false,
         cancel_all_on_exit: false,
         cancel_on_risk_breach: false,
+        pause_on_risk_breach: false,
+        clear_pause: false,
+        pause_path: PathBuf::from("state/paused.json"),
         post_only: true,
         require_two_sided_live: true,
         min_price: dec!(0.05),
