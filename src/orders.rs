@@ -90,6 +90,15 @@ impl RiskBudget {
         self.remaining_collateral = max_decimal(self.remaining_collateral - locked, Decimal::ZERO);
     }
 
+    fn release_open_buy_order(&mut self, order: &OpenOrderResponse) {
+        if order.side != Side::Buy || !self.counted_open_buy_orders.remove(&order.id) {
+            return;
+        }
+
+        let locked = open_order_remaining_size(order) * order.price;
+        self.remaining_collateral += locked;
+    }
+
     fn reserve_new_collateral(&mut self, requested: Decimal) -> Decimal {
         let reserved = min_decimal(requested, self.remaining_collateral());
         self.remaining_collateral =
@@ -819,7 +828,11 @@ async fn reconcile_quote_plan(
             return Ok(());
         }
 
-        let canceled_ids = orders_to_cancel
+        let canceled_orders = orders_to_cancel
+            .iter()
+            .map(|order| (*order).clone())
+            .collect::<Vec<_>>();
+        let canceled_ids = canceled_orders
             .iter()
             .map(|order| order.id.clone())
             .collect::<BTreeSet<_>>();
@@ -839,6 +852,9 @@ async fn reconcile_quote_plan(
                 plan.market_slug, plan.outcome
             );
             return Ok(());
+        }
+        for order in &canceled_orders {
+            global_budget.release_open_buy_order(order);
         }
     }
 
@@ -2246,6 +2262,29 @@ mod tests {
         budget.reserve_open_buy_order(&order);
         assert_eq!(budget.remaining_collateral(), dec!(8));
         assert_eq!(budget.reserve_new_collateral(dec!(10)), dec!(8));
+    }
+
+    #[test]
+    fn risk_budget_releases_preflight_open_buy_collateral() {
+        let order = open_order(
+            "open-buy",
+            ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            },
+        );
+        let mut audit = OpenBuyCollateral::default();
+        audit.reserve_open_buy_order(&order);
+        let mut budget = RiskBudget::with_open_buy_collateral(dec!(10), audit);
+
+        budget.release_open_buy_order(&order);
+
+        assert_eq!(budget.remaining_collateral(), dec!(10));
+        assert_eq!(budget.reserve_new_collateral(dec!(10)), dec!(10));
+        budget.release_open_buy_order(&order);
+        assert_eq!(budget.remaining_collateral(), Decimal::ZERO);
     }
 
     #[test]
