@@ -51,9 +51,19 @@ pub(crate) struct RiskBudget {
 }
 
 pub(crate) enum PreflightRiskAuditResult {
-    Continue(RiskBudget),
+    Continue {
+        risk_budget: RiskBudget,
+        snapshots: Vec<PreflightMarketSnapshot>,
+    },
     SkipCycle,
     Stop,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreflightMarketSnapshot {
+    market_key: String,
+    token_quotes: Vec<TokenQuote>,
+    market_state: LiveMarketState,
 }
 
 impl RiskBudget {
@@ -147,13 +157,13 @@ struct TokenQuote {
     skip_reason: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LiveMarketState {
     tokens: Vec<LiveTokenState>,
     pending_orders: Vec<ProposedOrder>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LiveTokenState {
     token_id: U256,
     fair_price: Decimal,
@@ -290,10 +300,19 @@ pub(crate) async fn quote_market(
     live: Option<&LiveTrading>,
     market: &MarketResponse,
     cli: &Cli,
+    preflight_snapshot: Option<PreflightMarketSnapshot>,
     global_budget: &mut RiskBudget,
 ) -> Result<()> {
     let mut market_budget = RiskBudget::new(cli.max_collateral_per_market);
-    let token_quotes = build_market_token_quotes(public_client, market, cli).await?;
+    let market_key = market_key(market);
+    let (token_quotes, preflight_market_state) =
+        match preflight_snapshot_for_market(preflight_snapshot, &market_key)? {
+            Some(snapshot) => (snapshot.token_quotes, Some(snapshot.market_state)),
+            None => (
+                build_market_token_quotes(public_client, market, cli).await?,
+                None,
+            ),
+        };
 
     for token_quote in &token_quotes {
         if let Some(plan) = &token_quote.plan {
@@ -312,7 +331,20 @@ pub(crate) async fn quote_market(
     }
 
     if let Some(live) = live {
-        let mut market_state = LiveMarketState::load(live, &token_quotes).await?;
+        let mut market_state = if let Some(market_state) = preflight_market_state {
+            market_state
+        } else {
+            LiveMarketState::load(live, &token_quotes).await?
+        };
+        if let Some(reason) =
+            preflight_stale_data_reason(&token_quotes, &market_state, Instant::now(), cli)?
+        {
+            println!(
+                "skip live quote {}: stale live data ({reason})",
+                market.market_slug
+            );
+            return Ok(());
+        }
         for token_quote in &token_quotes {
             if let Some(plan) = &token_quote.plan {
                 if PauseState::load(&cli.pause_path)?.is_some() {
@@ -344,14 +376,16 @@ pub(crate) async fn preflight_risk_audit(
     cli: &Cli,
 ) -> Result<PreflightRiskAuditResult> {
     if markets.is_empty() {
-        return Ok(PreflightRiskAuditResult::Continue(RiskBudget::new(
-            cli.max_total_collateral,
-        )));
+        return Ok(PreflightRiskAuditResult::Continue {
+            risk_budget: RiskBudget::new(cli.max_total_collateral),
+            snapshots: Vec::new(),
+        });
     }
 
     println!("preflight risk audit: checking {} markets", markets.len());
     let mut global_open_buys = OpenBuyCollateral::default();
     let mut scanned_markets = Vec::new();
+    let mut snapshots = Vec::new();
 
     for market in markets {
         if let Some(pause) = PauseState::load(&cli.pause_path)? {
@@ -408,7 +442,12 @@ pub(crate) async fn preflight_risk_audit(
             return Ok(PreflightRiskAuditResult::Stop);
         }
 
-        scanned_markets.push((market.clone(), market_state));
+        scanned_markets.push((market.clone(), market_state.clone()));
+        snapshots.push(PreflightMarketSnapshot {
+            market_key: market_key(market),
+            token_quotes,
+            market_state,
+        });
     }
 
     if global_open_buys.collateral() > cli.max_total_collateral {
@@ -433,9 +472,31 @@ pub(crate) async fn preflight_risk_audit(
         return Ok(PreflightRiskAuditResult::Stop);
     }
 
-    Ok(PreflightRiskAuditResult::Continue(
-        RiskBudget::with_open_buy_collateral(cli.max_total_collateral, global_open_buys),
-    ))
+    Ok(PreflightRiskAuditResult::Continue {
+        risk_budget: RiskBudget::with_open_buy_collateral(
+            cli.max_total_collateral,
+            global_open_buys,
+        ),
+        snapshots,
+    })
+}
+
+fn preflight_snapshot_for_market(
+    snapshot: Option<PreflightMarketSnapshot>,
+    expected_market_key: &str,
+) -> Result<Option<PreflightMarketSnapshot>> {
+    if let Some(snapshot) = snapshot {
+        if snapshot.market_key != expected_market_key {
+            anyhow::bail!(
+                "preflight snapshot market mismatch: expected {}, got {}",
+                expected_market_key,
+                snapshot.market_key
+            );
+        }
+        return Ok(Some(snapshot));
+    }
+
+    Ok(None)
 }
 
 async fn build_market_token_quotes(
@@ -2291,6 +2352,24 @@ mod tests {
         assert_eq!(budget.reserve_new_collateral(dec!(10)), dec!(10));
         budget.release_open_buy_order(&order);
         assert_eq!(budget.remaining_collateral(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn preflight_snapshot_rejects_market_key_mismatch() {
+        let snapshot = PreflightMarketSnapshot {
+            market_key: "market-a".to_owned(),
+            token_quotes: Vec::new(),
+            market_state: test_market_state(),
+        };
+
+        let error = preflight_snapshot_for_market(Some(snapshot), "market-b")
+            .expect_err("mismatched snapshot should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("preflight snapshot market mismatch")
+        );
     }
 
     #[test]
