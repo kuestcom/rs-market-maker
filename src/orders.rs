@@ -336,6 +336,15 @@ pub(crate) async fn quote_market(
         } else {
             LiveMarketState::load(live, &token_quotes).await?
         };
+        if let Some(reason) =
+            preflight_stale_data_reason(&token_quotes, &market_state, Instant::now(), cli)?
+        {
+            println!(
+                "skip live quote {}: stale live data ({reason})",
+                market.market_slug
+            );
+            return Ok(());
+        }
         for token_quote in &token_quotes {
             if let Some(plan) = &token_quote.plan {
                 if PauseState::load(&cli.pause_path)?.is_some() {
