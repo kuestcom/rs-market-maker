@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::str::FromStr as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use anyhow::{Context as _, Result};
@@ -88,6 +88,7 @@ struct QuotePlan {
     fair_price: Decimal,
     best_bid: Option<Decimal>,
     best_ask: Option<Decimal>,
+    book_fetched_at: Instant,
     buy_band: Option<QuoteBand>,
     sell_band: Option<QuoteBand>,
 }
@@ -122,7 +123,9 @@ struct LiveTokenState {
     token_id: U256,
     fair_price: Decimal,
     balance: Decimal,
+    balance_fetched_at: Instant,
     open_orders: Vec<OpenOrderResponse>,
+    open_orders_fetched_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,7 +234,8 @@ pub(crate) async fn quote_market(
             .order_book(&request)
             .await
             .with_context(|| format!("failed to fetch order book for token {}", token.token_id))?;
-        let token_quote = build_token_quote(market, token, &book, cli);
+        let book_fetched_at = Instant::now();
+        let token_quote = build_token_quote(market, token, &book, book_fetched_at, cli);
 
         if let Some(plan) = &token_quote.plan {
             print_plan(plan, cli.live);
@@ -274,6 +278,7 @@ fn build_token_quote(
     market: &MarketResponse,
     token: &Token,
     book: &OrderBookSummaryResponse,
+    book_fetched_at: Instant,
     cli: &Cli,
 ) -> TokenQuote {
     let fair_price = fair_price(
@@ -289,7 +294,7 @@ fn build_token_quote(
         None
     };
     let plan = if liquidity_skip.is_none() {
-        build_quote_plan(market, token, book, cli)
+        build_quote_plan(market, token, book, book_fetched_at, cli)
     } else {
         None
     };
@@ -311,6 +316,7 @@ fn build_quote_plan(
     market: &MarketResponse,
     token: &Token,
     book: &OrderBookSummaryResponse,
+    book_fetched_at: Instant,
     cli: &Cli,
 ) -> Option<QuotePlan> {
     let best_bid = best_bid(&book.bids);
@@ -369,6 +375,7 @@ fn build_quote_plan(
         fair_price,
         best_bid,
         best_ask,
+        book_fetched_at,
         buy_band,
         sell_band,
     })
@@ -614,7 +621,12 @@ async fn reconcile_quote_plan(
             .map(|order| order.id.clone())
             .collect::<BTreeSet<_>>();
         open_orders = open_orders_for_token(live, plan.token_id).await?;
-        market_state.replace_open_orders(plan.token_id, open_orders.clone())?;
+        let open_orders_fetched_at = Instant::now();
+        market_state.replace_open_orders(
+            plan.token_id,
+            open_orders.clone(),
+            open_orders_fetched_at,
+        )?;
         if open_orders
             .iter()
             .any(|order| canceled_ids.contains(&order.id))
@@ -628,6 +640,13 @@ async fn reconcile_quote_plan(
     }
 
     let remaining_orders = open_orders.iter().collect::<Vec<_>>();
+    if let Some(reason) = stale_live_data_reason(plan, market_state, None, Instant::now(), cli)? {
+        println!(
+            "skip placing {} {}: stale live data ({reason})",
+            plan.market_slug, plan.outcome
+        );
+        return Ok(());
+    }
 
     for order in &remaining_orders {
         global_budget.reserve_open_buy_order(order);
@@ -635,6 +654,20 @@ async fn reconcile_quote_plan(
     }
 
     let collateral_balance = collateral_balance(live).await?;
+    let collateral_fetched_at = Instant::now();
+    if let Some(reason) = stale_live_data_reason(
+        plan,
+        market_state,
+        Some(collateral_fetched_at),
+        Instant::now(),
+        cli,
+    )? {
+        println!(
+            "skip placing {} {}: stale live data ({reason})",
+            plan.market_slug, plan.outcome
+        );
+        return Ok(());
+    }
     let token_balance = market_state.token_balance(plan.token_id)?;
     let locked_collateral = remaining_orders
         .iter()
@@ -768,6 +801,20 @@ async fn reconcile_quote_plan(
     }
 
     if planned_orders.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(reason) = stale_live_data_reason(
+        plan,
+        market_state,
+        Some(collateral_fetched_at),
+        Instant::now(),
+        cli,
+    )? {
+        println!(
+            "skip posting {} {}: stale live data ({reason})",
+            plan.market_slug, plan.outcome
+        );
         return Ok(());
     }
 
@@ -914,11 +961,17 @@ impl LiveMarketState {
     async fn load(live: &LiveTrading, token_quotes: &[TokenQuote]) -> Result<Self> {
         let mut tokens = Vec::new();
         for token_quote in token_quotes {
+            let balance = conditional_balance(live, token_quote.token_id).await?;
+            let balance_fetched_at = Instant::now();
+            let open_orders = open_orders_for_token(live, token_quote.token_id).await?;
+            let open_orders_fetched_at = Instant::now();
             tokens.push(LiveTokenState {
                 token_id: token_quote.token_id,
                 fair_price: token_quote.fair_price,
-                balance: conditional_balance(live, token_quote.token_id).await?,
-                open_orders: open_orders_for_token(live, token_quote.token_id).await?,
+                balance,
+                balance_fetched_at,
+                open_orders,
+                open_orders_fetched_at,
             });
         }
 
@@ -940,8 +993,11 @@ impl LiveMarketState {
         &mut self,
         token_id: U256,
         open_orders: Vec<OpenOrderResponse>,
+        fetched_at: Instant,
     ) -> Result<()> {
-        self.token_state_mut(token_id)?.open_orders = open_orders;
+        let token_state = self.token_state_mut(token_id)?;
+        token_state.open_orders = open_orders;
+        token_state.open_orders_fetched_at = fetched_at;
         Ok(())
     }
 
@@ -1345,8 +1401,13 @@ async fn apply_post_responses(
 
     if has_failed_response {
         let refreshed_orders = open_orders_for_token(live, plan.token_id).await?;
+        let open_orders_fetched_at = Instant::now();
         market_state.remove_pending_orders_now_open(&refreshed_orders);
-        market_state.replace_open_orders(plan.token_id, refreshed_orders)?;
+        market_state.replace_open_orders(
+            plan.token_id,
+            refreshed_orders,
+            open_orders_fetched_at,
+        )?;
         println!(
             "post state refreshed for {} {} after rejected order response",
             plan.market_slug, plan.outcome
@@ -1372,6 +1433,57 @@ fn apply_post_response(
     }
     market_state.record_pending_order(submitted_order.proposed_order);
     false
+}
+
+fn stale_live_data_reason(
+    plan: &QuotePlan,
+    market_state: &LiveMarketState,
+    collateral_fetched_at: Option<Instant>,
+    now: Instant,
+    cli: &Cli,
+) -> Result<Option<String>> {
+    let max_age = Duration::from_secs(cli.max_data_age_secs);
+    let token_state = market_state.token_state(plan.token_id)?;
+    Ok(
+        stale_input_reason("order book", plan.book_fetched_at, now, max_age)
+            .or_else(|| {
+                stale_input_reason(
+                    "open orders",
+                    token_state.open_orders_fetched_at,
+                    now,
+                    max_age,
+                )
+            })
+            .or_else(|| {
+                stale_input_reason(
+                    "token balance",
+                    token_state.balance_fetched_at,
+                    now,
+                    max_age,
+                )
+            })
+            .or_else(|| {
+                collateral_fetched_at.and_then(|fetched_at| {
+                    stale_input_reason("collateral balance", fetched_at, now, max_age)
+                })
+            }),
+    )
+}
+
+fn stale_input_reason(
+    input: &str,
+    fetched_at: Instant,
+    now: Instant,
+    max_age: Duration,
+) -> Option<String> {
+    let age = now.saturating_duration_since(fetched_at);
+    (age > max_age).then(|| {
+        format!(
+            "{input} age {}ms exceeds max {}ms",
+            age.as_millis(),
+            max_age.as_millis()
+        )
+    })
 }
 
 fn open_order_matches_proposed(order: &OpenOrderResponse, proposed_order: ProposedOrder) -> bool {
@@ -1720,7 +1832,7 @@ mod tests {
 
         market_state.remove_pending_orders_now_open(&refreshed_orders);
         market_state
-            .replace_open_orders(U256::from(1), refreshed_orders)
+            .replace_open_orders(U256::from(1), refreshed_orders, Instant::now())
             .expect("test token should exist");
 
         assert!(market_state.pending_orders.is_empty());
@@ -1732,6 +1844,36 @@ mod tests {
             1
         );
         assert_eq!(market_state.exposure().worst_loss(), dec!(2));
+    }
+
+    #[test]
+    fn stale_input_reason_flags_data_older_than_threshold() {
+        let now = Instant::now();
+        let reason = stale_input_reason(
+            "order book",
+            now - Duration::from_secs(11),
+            now,
+            Duration::from_secs(10),
+        );
+
+        assert!(
+            reason
+                .expect("old input should be stale")
+                .contains("order book")
+        );
+    }
+
+    #[test]
+    fn stale_input_reason_accepts_fresh_data() {
+        let now = Instant::now();
+        let reason = stale_input_reason(
+            "order book",
+            now - Duration::from_secs(9),
+            now,
+            Duration::from_secs(10),
+        );
+
+        assert!(reason.is_none());
     }
 
     fn level(price: Decimal, size: Decimal) -> OrderSummary {
@@ -1779,13 +1921,17 @@ mod tests {
                     token_id: U256::from(1),
                     fair_price: dec!(0.50),
                     balance: Decimal::ZERO,
+                    balance_fetched_at: Instant::now(),
                     open_orders: Vec::new(),
+                    open_orders_fetched_at: Instant::now(),
                 },
                 LiveTokenState {
                     token_id: U256::from(2),
                     fair_price: dec!(0.50),
                     balance: Decimal::ZERO,
+                    balance_fetched_at: Instant::now(),
                     open_orders: Vec::new(),
+                    open_orders_fetched_at: Instant::now(),
                 },
             ],
             pending_orders: Vec::new(),
@@ -1828,6 +1974,7 @@ mod tests {
             max_loss_per_market: dec!(25),
             max_total_collateral: dec!(50),
             min_free_collateral: Decimal::ONE,
+            max_data_age_secs: 10,
             max_open_orders_per_token: 2,
             discover_only: false,
             cycles: 1,

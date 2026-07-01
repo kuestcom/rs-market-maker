@@ -78,6 +78,16 @@ fn negative_top_depth_is_rejected() {
 }
 
 #[test]
+fn zero_max_data_age_is_rejected() {
+    let mut cli = valid_cli();
+    cli.max_data_age_secs = 0;
+
+    let error = validate_cli(&cli).expect_err("zero max data age should fail");
+
+    assert!(error.to_string().contains("MARKET_MAKER_MAX_DATA_AGE_SECS"));
+}
+
+#[test]
 fn invalid_band_margins_are_rejected() {
     let mut cli = valid_cli();
     cli.band_min_margin_ticks = Some(4);
@@ -172,6 +182,7 @@ fn valid_cli() -> Cli {
         max_loss_per_market: dec!(25),
         max_total_collateral: dec!(50),
         min_free_collateral: Decimal::ONE,
+        max_data_age_secs: 10,
         max_open_orders_per_token: 2,
         discover_only: false,
         cycles: 1,
