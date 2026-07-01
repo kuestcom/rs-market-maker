@@ -54,6 +54,34 @@ fn zero_loss_limit_is_rejected() {
 }
 
 #[test]
+fn zero_token_inventory_limit_is_rejected() {
+    let mut cli = valid_cli();
+    cli.max_inventory_per_token = Decimal::ZERO;
+
+    let error = validate_cli(&cli).expect_err("zero token inventory limit should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_MAX_INVENTORY_PER_TOKEN")
+    );
+}
+
+#[test]
+fn zero_market_inventory_limit_is_rejected() {
+    let mut cli = valid_cli();
+    cli.max_inventory_per_market = Decimal::ZERO;
+
+    let error = validate_cli(&cli).expect_err("zero market inventory limit should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("MARKET_MAKER_MAX_INVENTORY_PER_MARKET")
+    );
+}
+
+#[test]
 fn zero_max_book_spread_is_rejected() {
     let mut cli = valid_cli();
     cli.max_book_spread_ticks = 0;
@@ -180,6 +208,8 @@ fn valid_cli() -> Cli {
         max_price: dec!(0.95),
         max_collateral_per_market: dec!(25),
         max_loss_per_market: dec!(25),
+        max_inventory_per_token: dec!(25),
+        max_inventory_per_market: dec!(50),
         max_total_collateral: dec!(50),
         min_free_collateral: Decimal::ONE,
         max_data_age_secs: 10,

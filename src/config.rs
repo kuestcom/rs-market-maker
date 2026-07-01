@@ -123,6 +123,20 @@ pub struct Cli {
     #[arg(long, env = "MARKET_MAKER_MAX_LOSS_PER_MARKET", default_value = "25")]
     pub max_loss_per_market: Decimal,
 
+    #[arg(
+        long,
+        env = "MARKET_MAKER_MAX_INVENTORY_PER_TOKEN",
+        default_value = "25"
+    )]
+    pub max_inventory_per_token: Decimal,
+
+    #[arg(
+        long,
+        env = "MARKET_MAKER_MAX_INVENTORY_PER_MARKET",
+        default_value = "50"
+    )]
+    pub max_inventory_per_market: Decimal,
+
     #[arg(long, env = "MARKET_MAKER_MAX_TOTAL_COLLATERAL", default_value = "50")]
     pub max_total_collateral: Decimal,
 
@@ -281,6 +295,12 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if cli.max_loss_per_market <= Decimal::ZERO {
         bail!("MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero");
+    }
+    if cli.max_inventory_per_token <= Decimal::ZERO {
+        bail!("MARKET_MAKER_MAX_INVENTORY_PER_TOKEN must be greater than zero");
+    }
+    if cli.max_inventory_per_market <= Decimal::ZERO {
+        bail!("MARKET_MAKER_MAX_INVENTORY_PER_MARKET must be greater than zero");
     }
     if cli.max_total_collateral <= Decimal::ZERO {
         bail!("MARKET_MAKER_MAX_TOTAL_COLLATERAL must be greater than zero");

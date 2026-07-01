@@ -68,6 +68,8 @@ top-of-book depth before quoting. After cancel requests, live mode refreshes
 open orders before posting replacements; after post responses, it only counts
 accepted orders as pending local exposure. It also skips live posts when order
 books, balances, or open orders are older than the configured data-age limit.
+Buy-side sizing is inventory-aware: balances, live open orders, and pending
+orders are counted before adding more long exposure to an outcome or market.
 
 To cancel scoped live orders without quoting, run:
 
@@ -258,6 +260,18 @@ normal discovery selection.
   open orders, and the proposed new order are counted. Necessary because
   collateral caps alone do not account for cross-outcome inventory. Existing
   balances are marked at current fair value because fill history is not tracked.
+
+  --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
+  Default: 25.
+  Maximum long outcome-token inventory allowed after balances, live open
+  orders, and pending orders are counted. Buy orders are capped or skipped when
+  this limit leaves too little room.
+
+  --max-inventory-per-market / MARKET_MAKER_MAX_INVENTORY_PER_MARKET
+  Default: 50.
+  Maximum total long inventory across a market's outcome tokens. Necessary to
+  stop the bot from accumulating too many shares in one market even when each
+  individual token is under its own cap.
 
   --max-total-collateral / MARKET_MAKER_MAX_TOTAL_COLLATERAL
   Default: 50.

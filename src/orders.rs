@@ -99,6 +99,7 @@ struct QuoteBand {
     price: Decimal,
     min_price: Decimal,
     max_price: Decimal,
+    minimum_size: Decimal,
     min_size: Decimal,
     avg_size: Decimal,
     max_size: Decimal,
@@ -168,6 +169,13 @@ struct OutcomeExposure {
 enum BuyTopUpDecision {
     Place { size: Decimal, collateral: Decimal },
     Skip { affordable_size: Decimal },
+}
+
+#[derive(Debug, PartialEq)]
+struct InventoryBuyRoom {
+    token_position: Decimal,
+    market_inventory: Decimal,
+    room: Decimal,
 }
 
 #[derive(Debug, PartialEq)]
@@ -434,6 +442,7 @@ fn build_quote_band(
         price,
         min_price,
         max_price,
+        minimum_size: order_size(market, Decimal::ZERO, cli),
         min_size: order_size(market, min_size, cli),
         avg_size: order_size(market, avg_size, cli),
         max_size: order_size(market, max_size, cli),
@@ -696,56 +705,85 @@ async fn reconcile_quote_plan(
     {
         let open_size = band_open_size(&remaining_orders, band);
         if let Some(missing_size) = band_missing_size(band, open_size) {
-            match buy_top_up_decision(
-                missing_size,
-                band.price,
-                free_collateral,
-                global_budget,
-                market_budget,
-            ) {
-                BuyTopUpDecision::Place { size, collateral } => {
-                    let proposed_order = ProposedOrder {
-                        token_id: plan.token_id,
-                        side: Side::Buy,
-                        price: band.price,
-                        size,
-                    };
-                    if !market_loss_exceeds_cap(
-                        plan,
-                        proposed_order,
-                        market_state,
-                        &planned_orders,
-                        cli,
-                    )? {
-                        let order = live
-                            .client
-                            .limit_order()
-                            .token_id(plan.token_id)
-                            .side(Side::Buy)
-                            .price(band.price)
-                            .size(size)
-                            .order_type(OrderType::GTC)
-                            .post_only(cli.post_only)
-                            .build()
-                            .await
-                            .with_context(|| {
-                                format!("failed to build buy order for token {}", plan.token_id)
-                            })?;
-                        planned_orders.push(PlannedOrder {
-                            side: Side::Buy,
-                            proposed_order,
-                            signed_order: live.client.sign(&live.signer, order).await?,
-                            collateral,
-                        });
-                        new_order_slots -= 1;
-                    }
-                }
-                BuyTopUpDecision::Skip { affordable_size } => {
+            let inventory_room =
+                market_state.inventory_buy_room(plan.token_id, &planned_orders, cli)?;
+            if let Some(inventory_size) =
+                inventory_adjusted_buy_size(missing_size, band.minimum_size, inventory_room.room)
+            {
+                if inventory_size < missing_size {
                     println!(
-                        "skip {} {} buy: risk budget/free collateral leaves size {} below band target {}",
-                        plan.market_slug, plan.outcome, affordable_size, missing_size
+                        "cap {} {} buy size from {} to {}: token position {} / max {}, market inventory {} / max {}",
+                        plan.market_slug,
+                        plan.outcome,
+                        missing_size,
+                        inventory_size,
+                        inventory_room.token_position,
+                        cli.max_inventory_per_token,
+                        inventory_room.market_inventory,
+                        cli.max_inventory_per_market
                     );
                 }
+                match buy_top_up_decision(
+                    inventory_size,
+                    band.price,
+                    free_collateral,
+                    global_budget,
+                    market_budget,
+                ) {
+                    BuyTopUpDecision::Place { size, collateral } => {
+                        let proposed_order = ProposedOrder {
+                            token_id: plan.token_id,
+                            side: Side::Buy,
+                            price: band.price,
+                            size,
+                        };
+                        if !market_loss_exceeds_cap(
+                            plan,
+                            proposed_order,
+                            market_state,
+                            &planned_orders,
+                            cli,
+                        )? {
+                            let order = live
+                                .client
+                                .limit_order()
+                                .token_id(plan.token_id)
+                                .side(Side::Buy)
+                                .price(band.price)
+                                .size(size)
+                                .order_type(OrderType::GTC)
+                                .post_only(cli.post_only)
+                                .build()
+                                .await
+                                .with_context(|| {
+                                    format!("failed to build buy order for token {}", plan.token_id)
+                                })?;
+                            planned_orders.push(PlannedOrder {
+                                side: Side::Buy,
+                                proposed_order,
+                                signed_order: live.client.sign(&live.signer, order).await?,
+                                collateral,
+                            });
+                            new_order_slots -= 1;
+                        }
+                    }
+                    BuyTopUpDecision::Skip { affordable_size } => {
+                        println!(
+                            "skip {} {} buy: risk budget/free collateral leaves size {} below band target {}",
+                            plan.market_slug, plan.outcome, affordable_size, inventory_size
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "skip {} {} buy: inventory room {} below minimum order size {} (token position {}, market inventory {})",
+                    plan.market_slug,
+                    plan.outcome,
+                    inventory_room.room,
+                    band.minimum_size,
+                    inventory_room.token_position,
+                    inventory_room.market_inventory
+                );
             }
         }
     }
@@ -1014,12 +1052,30 @@ impl LiveMarketState {
         order: ProposedOrder,
         staged_orders: &[PlannedOrder],
     ) -> Result<Decimal> {
-        let mut exposure = self.exposure();
-        for staged_order in staged_orders {
-            exposure.apply_order(staged_order.proposed_order)?;
-        }
+        let mut exposure = self.exposure_with_staged(staged_orders)?;
         exposure.apply_order(order)?;
         Ok(exposure.worst_loss())
+    }
+
+    fn inventory_buy_room(
+        &self,
+        token_id: U256,
+        staged_orders: &[PlannedOrder],
+        cli: &Cli,
+    ) -> Result<InventoryBuyRoom> {
+        let token_position = self.long_inventory_for_token(token_id, staged_orders)?;
+        let market_inventory = self.long_market_inventory(staged_orders);
+        let token_room = max_decimal(cli.max_inventory_per_token - token_position, Decimal::ZERO);
+        let market_room = max_decimal(
+            cli.max_inventory_per_market - market_inventory,
+            Decimal::ZERO,
+        );
+
+        Ok(InventoryBuyRoom {
+            token_position,
+            market_inventory,
+            room: min_decimal(token_room, market_room),
+        })
     }
 
     fn record_pending_order(&mut self, order: ProposedOrder) {
@@ -1056,6 +1112,44 @@ impl LiveMarketState {
         }
 
         exposure
+    }
+
+    fn exposure_with_staged(&self, staged_orders: &[PlannedOrder]) -> Result<MarketExposure> {
+        let mut exposure = self.exposure();
+        for staged_order in staged_orders {
+            exposure.apply_order(staged_order.proposed_order)?;
+        }
+        Ok(exposure)
+    }
+
+    fn long_inventory_for_token(
+        &self,
+        token_id: U256,
+        staged_orders: &[PlannedOrder],
+    ) -> Result<Decimal> {
+        let token_state = self.token_state(token_id)?;
+        Ok(token_long_inventory(
+            token_state.balance,
+            &token_state.open_orders,
+            &self.pending_orders,
+            staged_orders,
+            token_id,
+        ))
+    }
+
+    fn long_market_inventory(&self, staged_orders: &[PlannedOrder]) -> Decimal {
+        self.tokens
+            .iter()
+            .map(|token_state| {
+                token_long_inventory(
+                    token_state.balance,
+                    &token_state.open_orders,
+                    &self.pending_orders,
+                    staged_orders,
+                    token_state.token_id,
+                )
+            })
+            .sum()
     }
 
     fn token_state(&self, token_id: U256) -> Result<&LiveTokenState> {
@@ -1134,6 +1228,44 @@ fn apply_order_to_outcome(outcome: &mut OutcomeExposure, order: ProposedOrder) {
     }
 }
 
+fn token_long_inventory(
+    balance: Decimal,
+    open_orders: &[OpenOrderResponse],
+    pending_orders: &[ProposedOrder],
+    staged_orders: &[PlannedOrder],
+    token_id: U256,
+) -> Decimal {
+    max_decimal(balance, Decimal::ZERO)
+        + buy_order_size_for_token(open_orders, token_id)
+        + pending_buy_size_for_token(pending_orders, token_id)
+        + staged_buy_size_for_token(staged_orders, token_id)
+}
+
+fn buy_order_size_for_token(orders: &[OpenOrderResponse], token_id: U256) -> Decimal {
+    orders
+        .iter()
+        .filter(|order| order.asset_id == token_id && order.side == Side::Buy)
+        .map(open_order_remaining_size)
+        .sum()
+}
+
+fn pending_buy_size_for_token(orders: &[ProposedOrder], token_id: U256) -> Decimal {
+    orders
+        .iter()
+        .filter(|order| order.token_id == token_id && order.side == Side::Buy)
+        .map(|order| order.size)
+        .sum()
+}
+
+fn staged_buy_size_for_token(orders: &[PlannedOrder], token_id: U256) -> Decimal {
+    orders
+        .iter()
+        .map(|order| order.proposed_order)
+        .filter(|order| order.token_id == token_id && order.side == Side::Buy)
+        .map(|order| order.size)
+        .sum()
+}
+
 fn market_loss_exceeds_cap(
     plan: &QuotePlan,
     proposed_order: ProposedOrder,
@@ -1180,6 +1312,15 @@ fn buy_top_up_decision(
         size: missing_size,
         collateral,
     }
+}
+
+fn inventory_adjusted_buy_size(
+    requested_size: Decimal,
+    minimum_size: Decimal,
+    inventory_room: Decimal,
+) -> Option<Decimal> {
+    let size = min_decimal(requested_size, inventory_room);
+    (size >= minimum_size).then_some(size)
 }
 
 fn reserve_buy_collateral(
@@ -1727,6 +1868,7 @@ mod tests {
             price: dec!(0.49),
             min_price: dec!(0.47),
             max_price: dec!(0.49),
+            minimum_size: dec!(1),
             min_size: dec!(5),
             avg_size: dec!(10),
             max_size: dec!(15),
@@ -1746,6 +1888,7 @@ mod tests {
             price: dec!(0.49),
             min_price: dec!(0.47),
             max_price: dec!(0.49),
+            minimum_size: dec!(1),
             min_size: dec!(5),
             avg_size: dec!(10),
             max_size: dec!(15),
@@ -1754,6 +1897,96 @@ mod tests {
         assert_eq!(band_missing_size(&band, dec!(4)), Some(dec!(6)));
         assert_eq!(band_missing_size(&band, dec!(5)), None);
         assert_eq!(band_missing_size(&band, dec!(9)), None);
+    }
+
+    #[test]
+    fn inventory_adjusted_buy_size_caps_to_remaining_room() {
+        assert_eq!(
+            inventory_adjusted_buy_size(dec!(5), dec!(1), dec!(3)),
+            Some(dec!(3))
+        );
+    }
+
+    #[test]
+    fn inventory_adjusted_buy_size_skips_when_room_is_below_minimum() {
+        assert_eq!(
+            inventory_adjusted_buy_size(dec!(5), dec!(1), dec!(0.5)),
+            None
+        );
+    }
+
+    #[test]
+    fn inventory_buy_room_counts_balance_and_open_buys() {
+        let mut cli = test_cli();
+        cli.max_inventory_per_token = dec!(20);
+        cli.max_inventory_per_market = dec!(50);
+        let mut market_state = test_market_state();
+        market_state.tokens[0].balance = dec!(10);
+        market_state
+            .replace_open_orders(
+                U256::from(1),
+                vec![open_order(
+                    "open-buy",
+                    ProposedOrder {
+                        token_id: U256::from(1),
+                        side: Side::Buy,
+                        price: dec!(0.40),
+                        size: dec!(5),
+                    },
+                )],
+                Instant::now(),
+            )
+            .expect("test token should exist");
+
+        let room = market_state
+            .inventory_buy_room(U256::from(1), &[], &cli)
+            .expect("inventory room should be computed");
+
+        assert_eq!(
+            room,
+            InventoryBuyRoom {
+                token_position: dec!(15),
+                market_inventory: dec!(15),
+                room: dec!(5)
+            }
+        );
+    }
+
+    #[test]
+    fn inventory_buy_room_ignores_open_sells() {
+        let mut cli = test_cli();
+        cli.max_inventory_per_token = dec!(20);
+        cli.max_inventory_per_market = dec!(50);
+        let mut market_state = test_market_state();
+        market_state.tokens[0].balance = dec!(20);
+        market_state
+            .replace_open_orders(
+                U256::from(1),
+                vec![open_order(
+                    "open-sell",
+                    ProposedOrder {
+                        token_id: U256::from(1),
+                        side: Side::Sell,
+                        price: dec!(0.60),
+                        size: dec!(10),
+                    },
+                )],
+                Instant::now(),
+            )
+            .expect("test token should exist");
+
+        let room = market_state
+            .inventory_buy_room(U256::from(1), &[], &cli)
+            .expect("inventory room should be computed");
+
+        assert_eq!(
+            room,
+            InventoryBuyRoom {
+                token_position: dec!(20),
+                market_inventory: dec!(20),
+                room: Decimal::ZERO
+            }
+        );
     }
 
     #[test]
@@ -1972,6 +2205,8 @@ mod tests {
             max_price: dec!(0.95),
             max_collateral_per_market: dec!(25),
             max_loss_per_market: dec!(25),
+            max_inventory_per_token: dec!(25),
+            max_inventory_per_market: dec!(50),
             max_total_collateral: dec!(50),
             min_free_collateral: Decimal::ONE,
             max_data_age_secs: 10,
