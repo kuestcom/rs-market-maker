@@ -2074,6 +2074,12 @@ async fn pre_post_move_reject_reason(
             plan.token_id
         )
     })?;
+    if let Some(reason) = pre_post_liquidity_reject_reason(&book, cli) {
+        return Ok(Some(format!(
+            "refreshed book liquidity check failed: {}",
+            reason.message()
+        )));
+    }
     let refreshed_fair = fair_price(
         best_bid(&book.bids),
         best_ask(&book.asks),
@@ -2086,6 +2092,15 @@ async fn pre_post_move_reject_reason(
         book.tick_size.as_decimal(),
         cli.max_pre_post_move_ticks,
     ))
+}
+
+fn pre_post_liquidity_reject_reason(
+    book: &OrderBookSummaryResponse,
+    cli: &Cli,
+) -> Option<LiquidityRejectReason> {
+    should_enforce_liquidity_quality(cli)
+        .then(|| liquidity_quality_reject_reason(book, cli))
+        .flatten()
 }
 
 fn price_move_reject_reason(
@@ -2604,6 +2619,48 @@ mod tests {
             20,
             dec!(5),
         );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn pre_post_liquidity_guard_rejects_missing_two_sided_book() {
+        let mut cli = test_cli();
+        cli.live = true;
+        cli.require_two_sided_live = true;
+        let book = OrderBookSummaryResponse::builder()
+            .market(Default::default())
+            .asset_id(U256::from(1))
+            .timestamp("2024-01-15T12:34:56Z".parse().unwrap())
+            .bids(vec![level(dec!(0.49), dec!(10))])
+            .asks(Vec::new())
+            .min_order_size(dec!(1))
+            .neg_risk(false)
+            .tick_size(dec!(0.01).try_into().unwrap())
+            .build();
+
+        let reason = pre_post_liquidity_reject_reason(&book, &cli);
+
+        assert_eq!(reason, Some(LiquidityRejectReason::MissingTwoSidedBook));
+    }
+
+    #[test]
+    fn pre_post_liquidity_guard_follows_live_flag() {
+        let mut cli = test_cli();
+        cli.live = false;
+        cli.require_two_sided_live = true;
+        let book = OrderBookSummaryResponse::builder()
+            .market(Default::default())
+            .asset_id(U256::from(1))
+            .timestamp("2024-01-15T12:34:56Z".parse().unwrap())
+            .bids(vec![level(dec!(0.49), dec!(10))])
+            .asks(Vec::new())
+            .min_order_size(dec!(1))
+            .neg_risk(false)
+            .tick_size(dec!(0.01).try_into().unwrap())
+            .build();
+
+        let reason = pre_post_liquidity_reject_reason(&book, &cli);
 
         assert_eq!(reason, None);
     }
