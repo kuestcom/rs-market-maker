@@ -97,6 +97,13 @@ pub struct Cli {
     #[arg(long, env = "MARKET_MAKER_CANCEL_ALL_ON_EXIT", default_value_t = false)]
     pub cancel_all_on_exit: bool,
 
+    #[arg(
+        long,
+        env = "MARKET_MAKER_CANCEL_ON_RISK_BREACH",
+        default_value_t = false
+    )]
+    pub cancel_on_risk_breach: bool,
+
     #[arg(long, env = "MARKET_MAKER_POST_ONLY", default_value_t = true)]
     pub post_only: bool,
 
@@ -280,6 +287,9 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     }
     if (cli.cancel_all || cli.cancel_all_on_exit) && !cli.live {
         bail!("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live");
+    }
+    if cli.cancel_on_risk_breach && !cli.live {
+        bail!("MARKET_MAKER_CANCEL_ON_RISK_BREACH requires --live");
     }
     if cli.min_price <= Decimal::ZERO || cli.min_price >= Decimal::ONE {
         bail!("MARKET_MAKER_MIN_PRICE must be between 0 and 1");

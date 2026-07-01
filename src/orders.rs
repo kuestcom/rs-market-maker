@@ -179,6 +179,27 @@ struct InventoryBuyRoom {
 }
 
 #[derive(Debug, PartialEq)]
+enum RiskBreach {
+    TokenInventory {
+        token_id: U256,
+        inventory: Decimal,
+        limit: Decimal,
+    },
+    MarketInventory {
+        inventory: Decimal,
+        limit: Decimal,
+    },
+    MarketLoss {
+        loss: Decimal,
+        limit: Decimal,
+    },
+    MarketCollateral {
+        collateral: Decimal,
+        limit: Decimal,
+    },
+}
+
+#[derive(Debug, PartialEq)]
 enum LiquidityRejectReason {
     MissingTwoSidedBook,
     InvalidTick,
@@ -662,6 +683,23 @@ async fn reconcile_quote_plan(
         market_budget.reserve_open_buy_order(order);
     }
 
+    let breaches = market_state.risk_breaches(cli);
+    if !breaches.is_empty() {
+        print_risk_breaches(plan, &breaches);
+        if cli.cancel_on_risk_breach
+            && let Some(refreshed_orders) =
+                cancel_risk_increasing_orders(live, plan, &remaining_orders).await?
+        {
+            let open_orders_fetched_at = Instant::now();
+            market_state.replace_open_orders(
+                plan.token_id,
+                refreshed_orders,
+                open_orders_fetched_at,
+            )?;
+        }
+        return Ok(());
+    }
+
     let collateral_balance = collateral_balance(live).await?;
     let collateral_fetched_at = Instant::now();
     if let Some(reason) = stale_live_data_reason(
@@ -1078,6 +1116,49 @@ impl LiveMarketState {
         })
     }
 
+    fn risk_breaches(&self, cli: &Cli) -> Vec<RiskBreach> {
+        let mut breaches = Vec::new();
+        for token_state in &self.tokens {
+            let inventory = self
+                .long_inventory_for_token(token_state.token_id, &[])
+                .unwrap_or(Decimal::ZERO);
+            if inventory > cli.max_inventory_per_token {
+                breaches.push(RiskBreach::TokenInventory {
+                    token_id: token_state.token_id,
+                    inventory,
+                    limit: cli.max_inventory_per_token,
+                });
+            }
+        }
+
+        let market_inventory = self.long_market_inventory(&[]);
+        if market_inventory > cli.max_inventory_per_market {
+            breaches.push(RiskBreach::MarketInventory {
+                inventory: market_inventory,
+                limit: cli.max_inventory_per_market,
+            });
+        }
+
+        let exposure = self.exposure();
+        let loss = exposure.worst_loss();
+        if loss > cli.max_loss_per_market {
+            breaches.push(RiskBreach::MarketLoss {
+                loss,
+                limit: cli.max_loss_per_market,
+            });
+        }
+
+        let collateral = exposure.buy_collateral();
+        if collateral > cli.max_collateral_per_market {
+            breaches.push(RiskBreach::MarketCollateral {
+                collateral,
+                limit: cli.max_collateral_per_market,
+            });
+        }
+
+        breaches
+    }
+
     fn record_pending_order(&mut self, order: ProposedOrder) {
         self.pending_orders.push(order);
     }
@@ -1211,6 +1292,13 @@ impl MarketExposure {
 
         max_decimal(cost - proceeds - worst_resolution_payout, Decimal::ZERO)
     }
+
+    fn buy_collateral(&self) -> Decimal {
+        self.outcomes
+            .iter()
+            .map(|outcome| outcome.cost)
+            .sum::<Decimal>()
+    }
 }
 
 fn apply_order_to_outcome(outcome: &mut OutcomeExposure, order: ProposedOrder) {
@@ -1264,6 +1352,75 @@ fn staged_buy_size_for_token(orders: &[PlannedOrder], token_id: U256) -> Decimal
         .filter(|order| order.token_id == token_id && order.side == Side::Buy)
         .map(|order| order.size)
         .sum()
+}
+
+fn print_risk_breaches(plan: &QuotePlan, breaches: &[RiskBreach]) {
+    for breach in breaches {
+        println!(
+            "risk breach {} {}: {}",
+            plan.market_slug,
+            plan.outcome,
+            breach.message()
+        );
+    }
+}
+
+impl RiskBreach {
+    fn message(&self) -> String {
+        match self {
+            Self::TokenInventory {
+                token_id,
+                inventory,
+                limit,
+            } => {
+                format!("token {token_id} inventory {inventory} exceeds limit {limit}")
+            }
+            Self::MarketInventory { inventory, limit } => {
+                format!("market inventory {inventory} exceeds limit {limit}")
+            }
+            Self::MarketLoss { loss, limit } => {
+                format!("market loss {loss} exceeds limit {limit}")
+            }
+            Self::MarketCollateral { collateral, limit } => {
+                format!("market collateral {collateral} exceeds limit {limit}")
+            }
+        }
+    }
+}
+
+async fn cancel_risk_increasing_orders(
+    live: &LiveTrading,
+    plan: &QuotePlan,
+    open_orders: &[&OpenOrderResponse],
+) -> Result<Option<Vec<OpenOrderResponse>>> {
+    let order_ids = open_orders
+        .iter()
+        .filter(|order| order.side == Side::Buy)
+        .map(|order| order.id.as_str())
+        .collect::<Vec<_>>();
+    if order_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let response = live
+        .client
+        .cancel_orders(&order_ids)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to cancel risk-increasing buy orders for token {}",
+                plan.token_id
+            )
+        })?;
+    println!(
+        "risk breach cancel {} {}: canceled={} not_canceled={}",
+        plan.market_slug,
+        plan.outcome,
+        response.canceled.len(),
+        response.not_canceled.len()
+    );
+
+    Ok(Some(open_orders_for_token(live, plan.token_id).await?))
 }
 
 fn market_loss_exceeds_cap(
@@ -1703,6 +1860,24 @@ mod tests {
     }
 
     #[test]
+    fn open_buy_order_reserves_budget_before_risk_breach_return() {
+        let mut budget = RiskBudget::new(dec!(10));
+        let order = open_order(
+            "open-buy",
+            ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.40),
+                size: dec!(5),
+            },
+        );
+
+        budget.reserve_open_buy_order(&order);
+
+        assert_eq!(budget.remaining_collateral(), dec!(8));
+    }
+
+    #[test]
     fn market_exposure_counts_complete_set_as_hedged() {
         let exposure = MarketExposure {
             outcomes: vec![
@@ -1990,6 +2165,38 @@ mod tests {
     }
 
     #[test]
+    fn risk_breaches_detect_token_inventory_over_limit() {
+        let mut cli = test_cli();
+        cli.max_inventory_per_token = dec!(10);
+        let mut market_state = test_market_state();
+        market_state.tokens[0].balance = dec!(11);
+
+        let breaches = market_state.risk_breaches(&cli);
+
+        assert!(breaches.contains(&RiskBreach::TokenInventory {
+            token_id: U256::from(1),
+            inventory: dec!(11),
+            limit: dec!(10),
+        }));
+    }
+
+    #[test]
+    fn risk_breaches_detect_market_inventory_over_limit() {
+        let mut cli = test_cli();
+        cli.max_inventory_per_market = dec!(15);
+        let mut market_state = test_market_state();
+        market_state.tokens[0].balance = dec!(8);
+        market_state.tokens[1].balance = dec!(8);
+
+        let breaches = market_state.risk_breaches(&cli);
+
+        assert!(breaches.contains(&RiskBreach::MarketInventory {
+            inventory: dec!(16),
+            limit: dec!(15),
+        }));
+    }
+
+    #[test]
     fn accepted_buy_post_reserves_budget_and_records_pending_order() {
         let mut global_budget = RiskBudget::new(dec!(10));
         let mut market_budget = RiskBudget::new(dec!(10));
@@ -2199,6 +2406,7 @@ mod tests {
             cancel_before_quote: true,
             cancel_all: false,
             cancel_all_on_exit: false,
+            cancel_on_risk_breach: false,
             post_only: true,
             require_two_sided_live: true,
             min_price: dec!(0.05),
